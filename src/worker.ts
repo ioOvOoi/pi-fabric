@@ -13,6 +13,13 @@ import type {
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
+// Upper bound on how long the worker waits for a spawned pi child to finish
+// booting and accept the first RPC. Real-world startup with a full extension
+// suite (provider registration + several MCP servers) measured ~34s on
+// Windows, which the previous 15s window rejected outright. The Math.min
+// against the run timeout still shortens the wait for short-lived runs.
+const MODEL_ADMISSION_TIMEOUT_MS = 90_000;
+
 const spawnCli = (
   command: string,
   args: readonly string[],
@@ -954,7 +961,7 @@ const main = async (): Promise<void> => {
     child.stdin?.end();
   } else {
     if (options.model) {
-      modelTimer = setTimeout(() => modelControl.fail("RPC admission timed out; task was not sent"), Math.min(15_000, options.timeoutMs));
+      modelTimer = setTimeout(() => modelControl.fail("RPC admission timed out; task was not sent"), Math.min(MODEL_ADMISSION_TIMEOUT_MS, options.timeoutMs));
       modelTimer.unref();
     }
     modelControl.start();
