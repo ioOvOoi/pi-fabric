@@ -13,11 +13,10 @@ import type {
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
-// Upper bound on how long the worker waits for a spawned pi child to finish
-// booting and accept the first RPC. Real-world startup with a full extension
-// suite (provider registration + several MCP servers) measured ~34s on
-// Windows, which the previous 15s window rejected outright. The Math.min
-// against the run timeout still shortens the wait for short-lived runs.
+// 派发子 pi 后，等待其完成启动并接受首条 RPC 的时间上限。
+// 实测 Windows + 完整扩展套件（provider 注册 + 多个 MCP server）的启动约 34s，
+// 原 15s 窗口会在启动期内误杀所有带 model 的派发。
+// 与 Math.min(run timeout) 组合，保证短超时任务的等待不被放大。
 const MODEL_ADMISSION_TIMEOUT_MS = 90_000;
 
 const spawnCli = (
