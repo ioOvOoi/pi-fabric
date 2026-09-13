@@ -3,6 +3,8 @@ import { normalizeRunDisplay } from "./run-display.js";
 import { repairFabricGuestCode } from "./runtime/guest-code-repair.js";
 
 const OPTIONAL_FABRIC_EXEC_KEYS = [
+  // 宿主注入的 guest prelude：与其它可选键一样，null/undefined 表示没挂，清掉即可。
+  "prelude",
   "payloads",
   "strings",
   "resultFormat",

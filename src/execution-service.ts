@@ -50,6 +50,7 @@ import type {
 } from "./runtime/kernel.js";
 import type { TypeScriptKernelRuntime } from "./runtime/typescript-kernel.js";
 import type { FabricTypeError, FabricTypeCheckResult } from "./runtime/type-checker.js";
+import { composeGuestBundle } from "./runtime/guest-prelude.js";
 
 const executionOutcomeFromTermination = (
   reason: FabricSandboxTerminationReason,
@@ -114,6 +115,12 @@ export interface FabricExecutionAuthorizer {
 
 export interface FabricExecutionOptions {
   code: string;
+  /**
+   * 宿主注入的 guest prelude：由扩展（例如 Pi-Staffs）经 fabric_exec 的 `prelude` 入参挂上，
+   * 模型不该自己写。它单独过类型门禁并单独归因，执行时在 JS 层前置拼接，所以模型代码的诊断与
+   * 源映射都不受影响（过去扩展只能字符串前置拼接，prelude 一坏就打死整条通道）。
+   */
+  prelude?: string;
   strings?: Record<string, string>;
   /** Per-invocation whole-program deadline request from fabric_exec.timeoutMs.
    * Raises (never lowers) the configured executor.timeoutMs, subject to
@@ -184,6 +191,7 @@ export class FabricExecutionService {
     }
     let code = options.code;
     let checked: FabricTypeCheckResult = { errors: [] };
+    let preludeCheck: FabricTypeCheckResult | undefined;
     const unavailable = new Map(
       this.registry.unavailableProviders().map((entry) => [entry.name, entry.reason]),
     );
@@ -205,14 +213,42 @@ export class FabricExecutionService {
         update() {},
         ...(this.#capabilityView ? { capabilityView: this.#capabilityView } : {}),
       });
-      ({ code, checked } = (runtime as TypeScriptKernelRuntime).prepare(
+      ({ code, checked, preludeCheck } = (runtime as TypeScriptKernelRuntime).prepare(
         options.code,
         effectiveFullCodeMode,
         [...unavailable.keys()],
         guestTypeSources,
         coreOverrides,
+        options.prelude,
       ));
     }
+    if (preludeCheck && preludeCheck.errors.length > 0) {
+      // 宿主 prelude 坏了是宿主的责任：用 prelude 自己的行号报出来，走 error/logs 通道。
+      // 绝不能借用 typeErrors（那是模型代码的诊断通道），否则模型会拿到一份看不懂的「自己的」错误。
+      const detail = preludeCheck.errors
+        .map((error) =>
+          error.line > 0
+            ? `line ${error.line}:${error.column} — ${error.message}`
+            : error.message,
+        )
+        .join("; ");
+      const message = `Host guest prelude failed type checking (${
+        preludeCheck.errors.length
+      } ${preludeCheck.errors.length === 1 ? "error" : "errors"}): ${detail}`;
+      this.activity?.finish(options.parentToolCallId, false, "Host guest prelude failed type checking");
+      return {
+        success: false,
+        kernel: "typescript",
+        value: undefined,
+        logs: [message],
+        audits: [],
+        phases: [],
+        trace: traceRecorder.seal("failed", [], "Host guest prelude failed type checking"),
+        elapsedMs: performance.now() - startedAt,
+        error: message,
+      };
+    }
+
     if (checked.errors.length > 0) {
       for (const error of checked.errors) {
         const missing = /^Cannot find name '([^']+)'/.exec(error.message);
@@ -508,6 +544,13 @@ export class FabricExecutionService {
         observeInvocation,
       });
     };
+    // 宿主 prelude 在 JS 层前置拼接：它不在模型代码那份门禁里，所以门禁行号不受影响；
+    // 源映射按 prelude 的实际行数整体下移，运行时错误仍然定位到模型代码的真实行。
+    const guestBundle = composeGuestBundle({
+      prelude: preludeCheck?.javascript,
+      code: checked.javascript,
+      sourceMap: checked.sourceMap,
+    });
     let sandboxResult: FabricSandboxResult;
     try {
       sandboxResult = await runtime.execute(
@@ -760,8 +803,8 @@ export class FabricExecutionService {
           maxLogChars: this.config.executor.maxOutputChars,
           minimumTimeoutMsForHostCall,
           ...(!python ? { piToolCanonicalFields } : {}),
-          ...(checked.javascript ? { transpiledCode: checked.javascript } : {}),
-          ...(checked.sourceMap ? { transpiledSourceMap: checked.sourceMap } : {}),
+          ...(guestBundle.code ? { transpiledCode: guestBundle.code } : {}),
+          ...(guestBundle.sourceMap ? { transpiledSourceMap: guestBundle.sourceMap } : {}),
           ...(options.strings ? { strings: options.strings } : {}),
           ...(options.tokenBudget !== undefined ? { tokenBudget: options.tokenBudget } : {}),
           ...(options.signal ? { signal: options.signal } : {}),

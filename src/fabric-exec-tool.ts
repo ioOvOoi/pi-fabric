@@ -194,6 +194,14 @@ export const createFabricExecTool = (
             "Named payloads exposed under the same exact name as π.key (for example, payloads.contract becomes π.contract). Never reference a π key absent from this map. Useful for content that is awkward to quote inside code. Prefer an object of string values; a JSON-object string is parsed.",
         }),
       ),
+      // 宿主通道：扩展在 `tool_call` 钩子里挂上 prelude，模型不该自己写。它单独过类型门禁并单独
+      // 归因，因此 prelude 出错只会报「宿主 prelude 失败」，不会污染模型代码的诊断与行号。
+      prelude: Type.Optional(
+        Type.String({
+          description:
+            "Host-only guest prelude injected by an extension; type-checked in isolation and prepended at execution time",
+        }),
+      ),
       resultFormat: Type.Optional(Type.Union(RESULT_FORMATS.map((value) => Type.Literal(value)))),
       ...(python ? {} : {
         tokenBudget: Type.Optional(
@@ -824,6 +832,8 @@ export const createFabricExecTool = (
       // and quotes unquoted pi path arguments before Pi validates this call;
       // keep the same coercion here for direct internal invocations.
       const joined = Array.isArray(params.code) ? params.code.join("\n") : params.code;
+      // 宿主 prelude（扩展经 tool_call 钩子挂上）：与模型代码分开过门禁、分开归因。
+      const prelude = typeof params.prelude === "string" ? params.prelude : undefined;
       const code = state.config.executor.kernel === "python" ? joined : repairFabricGuestCode(joined);
       const runDisplay = normalizeRunDisplay(params.display);
       const strings = resolveFabricExecPayloads(params);
@@ -831,6 +841,7 @@ export const createFabricExecTool = (
         ? params.tokenBudget : undefined;
       const result = await state.execution.execute({
         code,
+        ...(prelude ? { prelude } : {}),
         ...(strings ? { strings } : {}),
         signal,
         parentToolCallId: toolCallId,

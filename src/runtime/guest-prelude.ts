@@ -65,9 +65,15 @@ export const composeGuestBundle = (parts: {
   const { code, sourceMap } = parts;
   const prelude = parts.prelude?.trim() ? parts.prelude : undefined;
   if (!code) return {};
-  if (!prelude) return { code, ...(sourceMap ? { sourceMap } : {}) };
-  return {
-    code: `${prelude}${BUNDLE_SEPARATOR}${code}`,
-    ...(sourceMap ? { sourceMap: shiftSourceMapLines(sourceMap, countLines(prelude)) } : {}),
-  };
+  // 只写实际存在的字段：tsconfig 开了 exactOptionalPropertyTypes，
+  // 展开出一个值为 undefined 的可选字段本身就不合法。
+  const bundle: FabricGuestBundle = { code };
+  if (!prelude) {
+    if (sourceMap !== undefined) bundle.sourceMap = sourceMap;
+    return bundle;
+  }
+  bundle.code = `${prelude}${BUNDLE_SEPARATOR}${code}`;
+  const shifted = shiftSourceMapLines(sourceMap, countLines(prelude));
+  if (shifted !== undefined) bundle.sourceMap = shifted;
+  return bundle;
 };
