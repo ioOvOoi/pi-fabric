@@ -45,10 +45,23 @@ async def _send(message):
     await _writer.drain()
 
 
-class _HostError(Exception):
+class _HostError(RuntimeError):
+    """宿主调用失败的内部异常。
+
+    对外契约是「宿主调用失败表现为 RuntimeError」，内部类型名不该泄漏进渲染出的 traceback
+    文本。Python 3.14 起 traceback.TracebackException.exc_type 变成只读 property，渲染期
+    改写类型这条路已经不通，所以把改名提前到类定义处（见下方 __name__/__qualname__）。
+    """
+
     def __init__(self, message, bash_exit=None):
         super().__init__(message)
         self.bash_exit = bash_exit
+
+
+# traceback 渲染类名优先取 __qualname__：名字在定义期就定成 RuntimeError，渲染结果天然是
+# "RuntimeError: ..."，不依赖任何随 Python 版本变化的可变属性。
+_HostError.__name__ = "RuntimeError"
+_HostError.__qualname__ = "RuntimeError"
 
 
 async def _call(ref, args):
@@ -191,8 +204,8 @@ def _error_text(error, source):
         if isinstance(original, SyntaxError) and original.filename == "fabric-exec.py":
             frames = []
         current.stack = traceback.StackSummary.from_list(frames)
-        if current.exc_type is _HostError:
-            current.exc_type = RuntimeError
+        # 这里不再改写 current.exc_type：宿主错误的类名已在定义处改成 RuntimeError，
+        # 而 Python 3.14 起 TracebackException.exc_type 是只读 property（赋值直接抛 AttributeError）。
         if len(seen) >= 8:
             current.__cause__ = None
             current.__context__ = None
