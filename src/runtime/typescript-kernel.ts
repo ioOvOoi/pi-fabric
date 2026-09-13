@@ -4,7 +4,7 @@ import type { FabricKernelRuntime, FabricHostCall, FabricSandboxOptions } from "
 import { QuickJsRuntime } from "./quickjs-runtime.js";
 import { BunProcessRuntime, NodeProcessRuntime } from "./node-process-runtime.js";
 import { repairFabricGuestCode } from "./guest-code-repair.js";
-import { typeCheckFabricCode } from "./type-checker.js";
+import { typeCheckFabricCode, typeCheckGuestPrelude } from "./type-checker.js";
 import { guestTypeDeclarations } from "./guest-types.js";
 import { buildDynamicGuestDeclarations } from "./dynamic-guest-types.js";
 import { buildCoreOverrideGuestDeclarations, type FabricCoreOverrideTypeSource } from "./core-override-guest-types.js";
@@ -28,17 +28,22 @@ export class TypeScriptKernelRuntime implements FabricKernelRuntime {
     unavailable: string[],
     sources: FabricGuestTypeSources,
     overrides: FabricCoreOverrideTypeSource[],
+    // 宿主注入的 guest prelude（扩展生成的辅助代码）。它**不进**模型代码那份门禁：
+    // 混在一起时 prelude 的错误会以模型代码的行号报出来，并把整条 fabric_exec 通道拒掉。
+    prelude?: string,
   ) {
     const code = repairFabricGuestCode(source);
     const coreOverrides = fullCodeMode
       ? buildCoreOverrideGuestDeclarations(overrides)
       : undefined;
-    const checked = typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode, {
+    const declarations = guestTypeDeclarations(fullCodeMode, {
       excludeGlobals: unavailable,
       dynamic: buildDynamicGuestDeclarations(sources),
       ...(coreOverrides ? { coreOverrides } : {}),
-    }));
-    return { code, checked };
+    });
+    const checked = typeCheckFabricCode(code, declarations);
+    const preludeCheck = prelude ? typeCheckGuestPrelude(prelude, declarations) : undefined;
+    return { code, checked, ...(preludeCheck ? { preludeCheck } : {}) };
   }
 
   execute(code: string, hostCall: FabricHostCall, options: FabricSandboxOptions) {

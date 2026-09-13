@@ -203,3 +203,46 @@ export const typeCheckFabricCode = (
   code: string,
   declarations: string,
 ): FabricTypeCheckResult => checkerFor(declarations).check(code);
+
+/**
+ * prelude 的独立门禁缓存。
+ * 键是「声明文本 + prelude 源码」：声明随当次会话的工具体系变化，prelude 由扩展按配置生成，
+ * 两者都不常变，命中率很高；而 prelude 动辄几百行，每次 fabric_exec 都重查一遍是纯浪费。
+ *
+ * 每个键配一个独立的 FabricTypeChecker 实例：checker 内部持有增量 program，
+ * 与模型代码那份门禁共用实例会让双方的增量信息互相作废。
+ */
+const guestPreludeCache = new Map<
+  string,
+  { checker: FabricTypeChecker; result: FabricTypeCheckResult }
+>();
+const MAX_GUEST_PRELUDES = 4;
+
+/** 宿主 prelude 的类型门禁：与模型代码完全分开，行号只相对 prelude 自己。 */
+export const typeCheckGuestPrelude = (
+  prelude: string,
+  declarations: string,
+): FabricTypeCheckResult => {
+  const key = `${declarations}\u0000${prelude}`;
+  const cached = guestPreludeCache.get(key);
+  if (cached) {
+    guestPreludeCache.delete(key);
+    guestPreludeCache.set(key, cached);
+    return cached.result;
+  }
+  const checker = new FabricTypeChecker(declarations);
+  const result = checker.check(prelude);
+  guestPreludeCache.set(key, { checker, result });
+  while (guestPreludeCache.size > MAX_GUEST_PRELUDES) {
+    const oldest = guestPreludeCache.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    guestPreludeCache.delete(oldest);
+  }
+  return result;
+};
+
+/** 仅测试用：清空 prelude 门禁缓存（生产路径没有清空的需求）。 */
+export const resetGuestPreludeCache = (): void => {
+  guestPreludeCache.clear();
+};
+
