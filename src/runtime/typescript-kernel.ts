@@ -28,8 +28,8 @@ export class TypeScriptKernelRuntime implements FabricKernelRuntime {
     unavailable: string[],
     sources: FabricGuestTypeSources,
     overrides: FabricCoreOverrideTypeSource[],
-    // 宿主注入的 guest prelude（扩展生成的辅助代码）。它**不进**模型代码那份门禁：
-    // 混在一起时 prelude 的错误会以模型代码的行号报出来，并把整条 fabric_exec 通道拒掉。
+    // 宿主注入的 guest prelude（扩展生成的辅助代码）。它单独过一遍门禁（错误归它自己、行号只相对它），
+    // 同时参与模型代码那次编译（否则模型看不见 prelude 声明的符号）。
     prelude?: string,
   ) {
     const code = repairFabricGuestCode(source);
@@ -41,7 +41,7 @@ export class TypeScriptKernelRuntime implements FabricKernelRuntime {
       dynamic: buildDynamicGuestDeclarations(sources),
       ...(coreOverrides ? { coreOverrides } : {}),
     });
-    const checked = typeCheckFabricCode(code, declarations);
+    const checked = typeCheckFabricCode(code, declarations, prelude);
     const preludeCheck = prelude ? typeCheckGuestPrelude(prelude, declarations) : undefined;
     return { code, checked, ...(preludeCheck ? { preludeCheck } : {}) };
   }

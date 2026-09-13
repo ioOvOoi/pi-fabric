@@ -12,7 +12,7 @@
  * 把源映射整体下移。
  */
 
-import { GUEST_WRAPPER_OPEN } from "./type-checker.js";
+import { GUEST_WRAPPER_OPEN, countGuestLines } from "./type-checker.js";
 
 export interface FabricGuestBundle {
   /** 拼接后的 emitted JS；没有可执行代码时缺省，调用方退回按源码转译。 */
@@ -32,12 +32,6 @@ const wrapperBodyAnchor = (code: string): number | undefined => {
   const opening = `${GUEST_WRAPPER_OPEN}${BUNDLE_SEPARATOR}`;
   const at = code.indexOf(opening);
   return at < 0 ? undefined : at + opening.length;
-};
-
-const countLines = (text: string): number => {
-  let lines = 1;
-  for (const char of text) if (char === "\n") lines += 1;
-  return lines;
 };
 
 /**
@@ -92,7 +86,7 @@ export const composeGuestBundle = (parts: {
   const bundle: FabricGuestBundle = {
     code: `${code.slice(0, anchored)}${prelude}${BUNDLE_SEPARATOR}${code.slice(anchored)}`,
   };
-  const shifted = shiftSourceMapLines(sourceMap, countLines(prelude));
+  const shifted = shiftSourceMapLines(sourceMap, countGuestLines(prelude));
   if (shifted !== undefined) bundle.sourceMap = shifted;
   return bundle;
 };

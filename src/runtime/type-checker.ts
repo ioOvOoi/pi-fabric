@@ -53,6 +53,17 @@ export const GUEST_WRAPPER_OPEN = "async function __piFabricMain() {";
 const wrapFabricGuestCode = (code: string): string =>
   `${GUEST_WRAPPER_OPEN}\n${code}\n}\n`;
 
+/**
+ * 一段源码在 wrapper 里占多少行。
+ * 宿主 prelude 插进同一作用域后，guest 源码行号整体后移这个量，
+ * 所以门禁减行号（本文件）与源映射补空映射（guest-prelude.ts）必须同口径。
+ */
+export const countGuestLines = (text: string): number => {
+  let lines = 1;
+  for (const char of text) if (char === "\n") lines += 1;
+  return lines;
+};
+
 class FabricTypeChecker {
   readonly #guestFile: string;
   readonly #declarationFile: string;
@@ -116,8 +127,16 @@ class FabricTypeChecker {
     };
   }
 
-  check(code: string): FabricTypeCheckResult {
-    this.#sourceText = wrapFabricGuestCode(code);
+  check(code: string, prelude?: string): FabricTypeCheckResult {
+    // 宿主 prelude 必须参与这次编译：模型代码要能看到它声明的符号（扩展注入的 staffs.* 之类），
+    // 否则门禁会把模型的每一次调用都判成 Cannot find name —— 那正是 prelude 通道要治的病。
+    // 代价是诊断行号整体后移，所以下面统一减掉 prelude 占的行数，并把落在 prelude 行域内的诊断丢掉
+    // （prelude 自己已过独立门禁，见 typeCheckGuestPrelude）。
+    const hostPrelude = prelude?.trim() ? prelude : undefined;
+    const preludeLines = hostPrelude === undefined ? 0 : countGuestLines(hostPrelude);
+    this.#sourceText = wrapFabricGuestCode(
+      hostPrelude === undefined ? code : `${hostPrelude}\n${code}`,
+    );
     this.#sourceFile = ts.createSourceFile(
       this.#guestFile,
       this.#sourceText,
@@ -149,7 +168,29 @@ class FabricTypeChecker {
         message,
       };
     });
-    if (errors.length > 0) return { errors };
+    // 含 prelude 的那份源码里，模型代码的第 1 行排在 prelude 之后，行号要减回去；
+    // 行号落在 prelude 行域内的诊断属于宿主 prelude，不是模型代码的错（line 0 是拿不到位置的诊断，保留）。
+    const relocated =
+      preludeLines === 0
+        ? errors
+        : errors
+            .filter((error) => error.line === 0 || error.line > preludeLines)
+            .map((error) =>
+              error.line === 0 ? error : { ...error, line: error.line - preludeLines },
+            );
+    if (relocated.length > 0) return { errors: relocated };
+
+    if (preludeLines > 0) {
+      // 有宿主 prelude 时不能再用 program.emit：那份 emitted JS 里已经含 prelude（执行期还会再拼一次），
+      // 且它源映射的源行号是「含 prelude 的源码行号」，运行时报错位置会整体漂移。
+      // 隔离转译只处理模型自己的代码，对这个 wrapper 而言输出与 program.emit 等价。
+      const transpiled = transpileFabricCodeWithSourceMap(code);
+      return {
+        errors: relocated,
+        javascript: transpiled.code,
+        ...(transpiled.sourceMap ? { sourceMap: transpiled.sourceMap } : {}),
+      };
+    }
 
     let javascript: string | undefined;
     let sourceMap: string | undefined;
@@ -158,7 +199,7 @@ class FabricTypeChecker {
       else if (fileName.endsWith(".js")) javascript = content;
     });
     return {
-      errors,
+      errors: relocated,
       ...(javascript ? { javascript } : {}),
       ...(sourceMap ? { sourceMap } : {}),
     };
@@ -204,10 +245,15 @@ export const transpileFabricCodeWithSourceMap = (code: string): FabricTranspileR
   };
 };
 
+/**
+ * 模型代码的类型门禁。`prelude` 是宿主注入的 guest prelude 源码（可选）：
+ * 传了就参与编译（符号对模型代码可见），但既不贡献诊断、也不吃行号。
+ */
 export const typeCheckFabricCode = (
   code: string,
   declarations: string,
-): FabricTypeCheckResult => checkerFor(declarations).check(code);
+  prelude?: string,
+): FabricTypeCheckResult => checkerFor(declarations).check(code, prelude);
 
 /**
  * prelude 的独立门禁缓存。
