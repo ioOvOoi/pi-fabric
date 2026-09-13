@@ -9,6 +9,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { classifyPiBashError } from "../src/core/pi-bash-error.js";
 import { CPYTHON_CHILD_SOURCE } from "../src/runtime/cpython-child-source.js";
+import { clearCpythonInterpreterCache, resolveCpythonInterpreter } from "../src/runtime/cpython-interpreter.js";
 import { CPythonRuntime } from "../src/runtime/cpython-runtime.js";
 import type { FabricHostCall, FabricSandboxOptions } from "../src/runtime/kernel.js";
 
@@ -21,9 +22,11 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   return { ...actual, access: vi.fn(actual.access) };
 });
 
-const python = childProcess.spawnSync("python3", ["-I", "-B", "-c", "import sys; print(sys.executable)"]);
-const hasPython = python.status === 0;
-const binary = hasPython ? python.stdout.toString().trim() : "python3";
+// 与运行时同一条解析路径：Windows 上 python3 常是商店占位符，旧探针把「存在」当成「可用」，
+// 结果是这些 CPython 用例在本机被静默跳过。
+const python = await resolveCpythonInterpreter("python3", process.cwd());
+const hasPython = python.ok;
+const binary = python.ok ? python.command : "python3";
 const options: FabricSandboxOptions = { timeoutMs: 5_000, memoryLimitBytes: 256 * 1024 * 1024 };
 const roots: string[] = [];
 const temp = (): string => {
@@ -169,6 +172,9 @@ describe.skipIf(!hasPython)("CPythonRuntime", () => {
 
   it("does not spawn after cancellation during interpreter resolution", async () => {
     const controller = new AbortController();
+    // 解析成功后会进缓存（同一解释器只探一次），而本用例要验证的正是「解析期间取消」：
+    // 先清缓存，保证这次执行真的会去发现并探针解释器，而不是命中缓存直接跳过。
+    clearCpythonInterpreterCache();
     const { access } = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
     vi.mocked(fsPromises.access).mockImplementationOnce(async (file, mode) => {
       await access(file, mode);

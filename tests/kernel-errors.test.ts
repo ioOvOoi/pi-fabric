@@ -1,6 +1,6 @@
-import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { describe, expect, it, vi } from "vitest";
+import { resolveCpythonInterpreter } from "../src/runtime/cpython-interpreter.js";
 import { CPythonRuntime } from "../src/runtime/cpython-runtime.js";
 import { MontyRuntime } from "../src/runtime/monty-runtime.js";
 import { pythonErrorRecoveryHint } from "../src/runtime/python-error-guidance.js";
@@ -16,10 +16,11 @@ try {
   if ((error as NodeJS.ErrnoException).code !== "MODULE_NOT_FOUND") throw error;
   montyAvailable = false;
 }
-const python = spawnSync("python3", ["-I", "-B", "-c", "import sys; assert sys.implementation.name == 'cpython' and sys.version_info >= (3, 10); print(sys.executable)"]);
-if (python.error && (python.error as NodeJS.ErrnoException).code !== "ENOENT") throw python.error;
-if (!python.error && python.status !== 0) throw new Error(`CPython probe failed: ${python.stderr.toString()}`);
-const cpythonAvailable = !python.error;
+// 解释器解析走运行时同一条路径：本机 python3 可能是商店占位符（存在、可执行、一跑就退非 0），
+// 旧探针会让整个测试套件在导入期就崩。解析不出来就当后端不可用跳过。
+const python = await resolveCpythonInterpreter("python3", process.cwd());
+const cpythonAvailable = python.ok;
+const pythonBinary = python.ok ? python.command : "python3";
 const options: FabricSandboxOptions = { timeoutMs: 5000, memoryLimitBytes: 256 * 1024 * 1024 };
 const echo: FabricHostCall = async () => ({ output: "ok" });
 
@@ -27,7 +28,7 @@ for (const backend of ["monty", "cpython"] as const) {
   const available = backend === "monty" ? montyAvailable : cpythonAvailable;
   if (!available) console.warn(`Skipping ${backend} diagnostics: backend dependency absent`);
   const run = (code: string, host: FabricHostCall = echo, extra: Partial<FabricSandboxOptions> = {}) =>
-    (backend === "monty" ? new MontyRuntime() : new CPythonRuntime(python.stdout.toString().trim())).execute(code, host, { ...options, ...extra });
+    (backend === "monty" ? new MontyRuntime() : new CPythonRuntime(pythonBinary)).execute(code, host, { ...options, ...extra });
   describe.skipIf(!available)(`${backend} real kernel diagnostics`, () => {
     it("preserves nested user frames and source, without bootstrap noise", async () => {
       const result = await run('def fail():\n    raise ValueError("user failure")\nfail()');

@@ -1,9 +1,8 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
-import { access, realpath } from "node:fs/promises";
+import { access } from "node:fs/promises";
 import net from "node:net";
-import path from "node:path";
 import type { Duplex } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { runAbortable, settleWithin } from "../async-settlement.js";
@@ -11,6 +10,7 @@ import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
 import type { FabricHostCall, FabricKernelRuntime, FabricSandboxOptions, FabricSandboxResult } from "./kernel.js";
 import { CPYTHON_CHILD_SOURCE } from "./cpython-child-source.js";
+import { resolveCpythonInterpreter } from "./cpython-interpreter.js";
 import { linuxCPythonNetworkFilter } from "./cpython-linux-sandbox.js";
 
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
@@ -23,34 +23,15 @@ const record = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
-const executable = async (binary: string, cwd: string): Promise<string> => {
-  // Windows stores executables with PATHEXT suffixes ("python3" -> "python3.exe");
-  // probe the variants spawn would find instead of failing on the bare name.
-  const extensions = process.platform === "win32"
-    ? String(process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)
-    : [];
-  const variants = (candidate: string): string[] =>
-    extensions.length && !/\.[A-Za-z0-9]+$/.test(candidate)
-      ? [candidate, ...extensions.map((extension) => candidate + extension)]
-      : [candidate];
-  const candidates = path.isAbsolute(binary) || binary.includes("/") || binary.includes("\\")
-    ? [path.resolve(cwd, binary)]
-    : (process.env.PATH ?? "").split(path.delimiter).map((directory) => path.resolve(cwd, directory || ".", binary));
-  for (const candidate of candidates) {
-    for (const variant of variants(candidate)) {
-      try {
-        await access(variant, constants.X_OK);
-        return await realpath(variant);
-      } catch {
-        // Continue only during executable discovery, never after a failed spawn.
-      }
-    }
-  }
-  throw new Error(`CPython executable not found: ${binary}. Install Python 3 or set executor.cpython.binary to a trusted executable's absolute path.`);
-};
+/** 取消不是「没有解释器」：调用方要把它翻成 aborted，而不是一句误导性的运行时错误。 */
+const cancellationError = (): Error => Object.assign(new Error("Execution cancelled"), { name: "AbortError" });
 
-const launch = async (binary: string, enforce: boolean, cwd: string): Promise<{ command: string; args: string[]; seccomp?: Buffer }> => {
-  const python = await executable(binary, cwd);
+const launch = async (binary: string, enforce: boolean, cwd: string, signal?: AbortSignal): Promise<{ command: string; args: string[]; seccomp?: Buffer }> => {
+  // 解释器解析（发现 + 探针验证 + 缓存）在 cpython-interpreter.ts：只 access(X_OK) 就当可用解释器是
+  // 旧实现的坑，Windows 商店占位符会一路装成真解释器。
+  const resolution = await resolveCpythonInterpreter(binary, cwd, { signal });
+  if (!resolution.ok) throw resolution.aborted ? cancellationError() : new Error(resolution.message);
+  const python = resolution.command;
   const args = ["-I", "-B", "-u", "-c", CPYTHON_CHILD_SOURCE];
   if (!enforce) return { command: python, args };
   if (process.platform === "darwin") {
@@ -103,8 +84,12 @@ export class CPythonRuntime implements FabricKernelRuntime {
     if (!Number.isFinite(options.timeoutMs) || options.timeoutMs < 1) return failure("runtime_error", "CPython timeout must be positive");
     const startedAt = Date.now();
     let command: Awaited<ReturnType<typeof launch>>;
-    try { command = await launch(this.binary, this.enforce, options.cwd ?? process.cwd()); }
-    catch (error) { return failure("runtime_error", errorText(error)); }
+    try { command = await launch(this.binary, this.enforce, options.cwd ?? process.cwd(), options.signal); }
+    catch (error) {
+      // 解析期被取消 → aborted（与 execute 开头的短路同一语义），其余才算真正的运行时错误。
+      if ((error as { name?: string } | null)?.name === "AbortError") return failure("aborted", "Execution cancelled");
+      return failure("runtime_error", errorText(error));
+    }
     // Resolve first, then check before spawn: no orphan on cancellation during discovery.
     if (options.signal?.aborted) return failure("aborted", "Execution cancelled");
     // Windows cannot inherit a socket through stdio; the child connects back instead.
