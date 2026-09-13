@@ -90,3 +90,20 @@ export const composeGuestBundle = (parts: {
   if (shifted !== undefined) bundle.sourceMap = shifted;
   return bundle;
 };
+
+/** python 内核挂 prelude 时给模型看的那条日志（不需要说明时返回 undefined）。 */
+export const IGNORED_PYTHON_PRELUDE_NOTICE =
+  "Host guest prelude was ignored: it is JavaScript, and the python kernel cannot run it. Use the typescript kernel whenever your extension injects a prelude.";
+
+/**
+ * python 内核跑的是 CPython，宿主 prelude 是 JS：拼进去只会得到语法错，所以它不参与 python 执行。
+ * 但扩展是按契约挂 prelude 的，静默丢弃会让调用方在 guest 里吃到 “xxx is not defined” 这种看不出原因
+ * 的错（模型只能靠猜）——所以这里给出模型可见的日志，说清被忽略了以及怎么才能生效。
+ */
+export const ignoredPreludeNotice = (input: {
+  python: boolean;
+  prelude?: string | undefined;
+}): string | undefined =>
+  input.python && input.prelude?.trim()
+    ? IGNORED_PYTHON_PRELUDE_NOTICE
+    : undefined;

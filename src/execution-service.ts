@@ -50,7 +50,10 @@ import type {
 } from "./runtime/kernel.js";
 import type { TypeScriptKernelRuntime } from "./runtime/typescript-kernel.js";
 import type { FabricTypeError, FabricTypeCheckResult } from "./runtime/type-checker.js";
-import { composeGuestBundle } from "./runtime/guest-prelude.js";
+import {
+  composeGuestBundle,
+  ignoredPreludeNotice,
+} from "./runtime/guest-prelude.js";
 
 const executionOutcomeFromTermination = (
   reason: FabricSandboxTerminationReason,
@@ -222,6 +225,12 @@ export class FabricExecutionService {
         options.prelude,
       ));
     }
+    // python 内核吃掉 prelude 这件事必须说出来（见 guest-prelude.ts 的 ignoredPreludeNotice）：
+    // 扩展挂了 prelude 却拿不到符号，在 guest 里会表现成 “xxx is not defined”，模型只能靠猜。
+    const preludeNotice = ignoredPreludeNotice({
+      python,
+      prelude: options.prelude,
+    });
     if (preludeCheck && preludeCheck.errors.length > 0) {
       // 宿主 prelude 坏了是宿主的责任：用 prelude 自己的行号报出来，走 error/logs 通道。
       // 绝不能借用 typeErrors（那是模型代码的诊断通道），否则模型会拿到一份看不懂的「自己的」错误。
@@ -830,7 +839,9 @@ export class FabricExecutionService {
       success: succeeded,
       kernel: python ? "python" : "typescript",
       value: sandboxResult.value,
-      logs: sandboxResult.logs,
+      logs: preludeNotice
+        ? [preludeNotice, ...sandboxResult.logs]
+        : sandboxResult.logs,
       audits,
       phases,
       // Guest and provider error text may embed tool output or source
