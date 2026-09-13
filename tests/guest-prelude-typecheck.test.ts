@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { GUEST_TYPE_DECLARATIONS } from "../src/runtime/guest-types.js";
 import {
   resetGuestPreludeCache,
+  transpileGuestPreludeBody,
   typeCheckFabricCode,
   typeCheckGuestPrelude,
 } from "../src/runtime/type-checker.js";
@@ -18,12 +19,15 @@ describe("宿主 guest prelude 的独立类型门禁", () => {
     expect(result.errors.every((error) => error.line >= 1 && error.line <= 3)).toBe(true);
   });
 
-  it("干净 prelude 给出 emitted JS，且同文本命中缓存", () => {
+  it("干净 prelude 给出的是执行体，不带 guest wrapper", () => {
     resetGuestPreludeCache();
     const prelude = "const helper = 1;\n";
     const first = typeCheckGuestPrelude(prelude, GUEST_TYPE_DECLARATIONS);
     expect(first.errors).toEqual([]);
     expect(first.javascript).toContain("const helper = 1;");
+    // 带 wrapper 的 prelude 会被拼成第二个 __piFabricMain，直接顶掉模型代码那份函数声明。
+    expect(first.javascript).not.toContain("__piFabricMain");
+    expect(transpileGuestPreludeBody(prelude)).not.toContain("__piFabricMain");
     expect(typeCheckGuestPrelude(prelude, GUEST_TYPE_DECLARATIONS)).toBe(first);
   });
 

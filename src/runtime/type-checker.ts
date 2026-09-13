@@ -44,9 +44,14 @@ let nextCheckerId = 0;
 export const normalizeTypeScriptPath = (fileName: string): string =>
   fileName.replaceAll("\\", "/");
 
-/** Guest programs execute inside this wrapper; user code starts on wrapped line 2. */
+/**
+ * Guest programs execute inside this wrapper; user code starts on wrapped line 2.
+ * 宿主 prelude 也插进这个 wrapper 内部（见 guest-prelude.ts），所以这行文本是拼接锚点：
+ * 改它要连带改 guest-prelude.ts 的 GUEST_WRAPPER_OPEN 匹配逻辑。
+ */
+export const GUEST_WRAPPER_OPEN = "async function __piFabricMain() {";
 const wrapFabricGuestCode = (code: string): string =>
-  `async function __piFabricMain() {\n${code}\n}\n`;
+  `${GUEST_WRAPPER_OPEN}\n${code}\n}\n`;
 
 class FabricTypeChecker {
   readonly #guestFile: string;
@@ -231,7 +236,14 @@ export const typeCheckGuestPrelude = (
     return cached.result;
   }
   const checker = new FabricTypeChecker(declarations);
-  const result = checker.check(prelude);
+  const checked = checker.check(prelude);
+  // prelude 要插进 guest wrapper **内部**、与模型代码共享作用域，所以能带出去的是「执行体」；
+  // 带 wrapper 的那份 emitted JS 一旦前置，就成了第二个 __piFabricMain 声明，直接顶掉模型代码。
+  // 诊断仍然来自带 wrapper 的那一次检查（行号只相对 prelude 自己）。
+  const result: FabricTypeCheckResult =
+    checked.errors.length > 0
+      ? { errors: checked.errors }
+      : { errors: [], javascript: transpileGuestPreludeBody(prelude) };
   guestPreludeCache.set(key, { checker, result });
   while (guestPreludeCache.size > MAX_GUEST_PRELUDES) {
     const oldest = guestPreludeCache.keys().next().value as string | undefined;
@@ -240,6 +252,15 @@ export const typeCheckGuestPrelude = (
   }
   return result;
 };
+
+/** prelude 的执行体：与模型代码同一作用域，但不带 guest wrapper。 */
+export const transpileGuestPreludeBody = (prelude: string): string =>
+  ts.transpileModule(prelude, {
+    compilerOptions: {
+      target: ts.ScriptTarget.ES2022,
+      module: ts.ModuleKind.ESNext,
+    },
+  }).outputText;
 
 /** 仅测试用：清空 prelude 门禁缓存（生产路径没有清空的需求）。 */
 export const resetGuestPreludeCache = (): void => {

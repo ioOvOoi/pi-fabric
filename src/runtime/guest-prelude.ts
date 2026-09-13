@@ -12,6 +12,8 @@
  * 把源映射整体下移。
  */
 
+import { GUEST_WRAPPER_OPEN } from "./type-checker.js";
+
 export interface FabricGuestBundle {
   /** 拼接后的 emitted JS；没有可执行代码时缺省，调用方退回按源码转译。 */
   code?: string;
@@ -20,6 +22,17 @@ export interface FabricGuestBundle {
 
 /** prelude 与模型代码之间固定一个换行；源映射的行数偏移就由它界定。 */
 const BUNDLE_SEPARATOR = "\n";
+
+/**
+ * 定位 guest wrapper 内部、模型代码开始处（即 wrapper 开头那一行之后）的偏移。
+ * 找不到就返回 undefined——锚点是 type-checker 生成 wrapper 时用的同一段文本，
+ * 出现找不到只可能是两边不同步，此时按「不拼接」处理更安全。
+ */
+const wrapperBodyAnchor = (code: string): number | undefined => {
+  const opening = `${GUEST_WRAPPER_OPEN}${BUNDLE_SEPARATOR}`;
+  const at = code.indexOf(opening);
+  return at < 0 ? undefined : at + opening.length;
+};
 
 const countLines = (text: string): number => {
   let lines = 1;
@@ -65,14 +78,20 @@ export const composeGuestBundle = (parts: {
   const { code, sourceMap } = parts;
   const prelude = parts.prelude?.trim() ? parts.prelude : undefined;
   if (!code) return {};
-  // 只写实际存在的字段：tsconfig 开了 exactOptionalPropertyTypes，
-  // 展开出一个值为 undefined 的可选字段本身就不合法。
-  const bundle: FabricGuestBundle = { code };
-  if (!prelude) {
+  const anchored = prelude === undefined ? undefined : wrapperBodyAnchor(code);
+  if (prelude === undefined || anchored === undefined) {
+    // 没有 prelude（旧路径），或者 emitted JS 里找不到 wrapper 锚点：都原样返回。
+    // 宁可让宿主 prelude 不生效，也不能拼出一段跑不起来、或者把模型代码顶掉的代码。
+    const bundle: FabricGuestBundle = { code };
     if (sourceMap !== undefined) bundle.sourceMap = sourceMap;
     return bundle;
   }
-  bundle.code = `${prelude}${BUNDLE_SEPARATOR}${code}`;
+  // prelude 落在 wrapper 内部：与模型代码同一作用域（宿主 prelude 因此能定义模型代码要用的符号）。
+  // 只写实际存在的字段：tsconfig 开了 exactOptionalPropertyTypes，
+  // 展开出一个值为 undefined 的可选字段本身就不合法。
+  const bundle: FabricGuestBundle = {
+    code: `${code.slice(0, anchored)}${prelude}${BUNDLE_SEPARATOR}${code.slice(anchored)}`,
+  };
   const shifted = shiftSourceMapLines(sourceMap, countLines(prelude));
   if (shifted !== undefined) bundle.sourceMap = shifted;
   return bundle;
