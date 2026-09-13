@@ -132,6 +132,23 @@ Host actions retain the same registry/schema validation, approvals, audit, timeo
 
 Guest-local callback APIs are not automatically available just because host providers share namespaces. In particular, do not assume TypeScript's `memory.walk(args, visitor)`, callback-based workflow helpers, or `agents.handoff({when: ...})` predicates work in Python. Use host actions such as `memory.expand` with explicit Python loops and `asyncio.gather` instead; follow returned paging refs through `tools.call`. Existing TypeScript workflow/skill examples are TypeScript-only unless explicitly documented for Python.
 
+## Extension preludes
+
+An enabled extension can attach a **guest prelude** to a call. The prelude is host-authored JavaScript that runs at the top of the generated guest wrapper, in the same scope as the program, so the program can call the helpers it declares. A `tool_call` hook sets the optional `prelude` argument and leaves the model's `code` argument untouched:
+
+```json
+{ "code": "return staffs.roles()", "prelude": "const staffs = { roles: () => [\"main\"] };" }
+```
+
+Preludes are TypeScript-kernel only and stay separate from the program in the parts that matter:
+
+- The prelude is type-checked in its own pass. A prelude error fails the call with prelude-relative line numbers and a `Host guest prelude failed type checking` message.
+- The program compiles with the prelude in scope, so declared symbols resolve. Diagnostics inside the prelude's line range stay attributed to the prelude, and the program's own line numbers remain program-relative.
+- Execution splices the emitted prelude inside the guest wrapper. The source map shifts by the prelude's line count, so runtime errors still point at the program's real lines.
+- A prelude with no emitted JavaScript, or an emitted program whose wrapper anchor is missing, leaves the program unmodified. Fabric never runs a prelude alone and never drops a failing prelude silently.
+
+Python kernels accept and ignore the argument.
+
 ## Repair, diagnostics, and compiler boundaries
 
 Python syntax/runtime errors report user source lines and bounded recovery hints without bridge/bootstrap frames. Common dictionary-access mistakes, JavaScript globals, invalid schemas, and unsupported imports include Python-specific next steps. Hints do not retry effects, rewrite source, or enable native execution. Monty preflights direct identifiers and unescaped literal payload keys, including f-string replacement fields; lexical nesting beyond 64 levels fails closed. Dynamic or escaped-key lookups remain runtime checks and can fail after earlier effects. Only a reported pre-execution rejection guarantees no prior host calls.

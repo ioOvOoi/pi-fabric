@@ -544,8 +544,8 @@ export class FabricExecutionService {
         observeInvocation,
       });
     };
-    // 宿主 prelude 在 JS 层前置拼接：它不在模型代码那份门禁里，所以门禁行号不受影响；
-    // 源映射按 prelude 的实际行数整体下移，运行时错误仍然定位到模型代码的真实行。
+    // 宿主 prelude 在 JS 层插进 guest wrapper 内部：与模型代码同一作用域，**不**参与模型代码那份 emitted JS
+    // （模型那份由门禁单独产出），源映射按 prelude 的实际行数整体下移，运行时错误仍定位到模型代码的真实行。
     const guestBundle = composeGuestBundle({
       prelude: preludeCheck?.javascript,
       code: checked.javascript,

@@ -194,12 +194,12 @@ export const createFabricExecTool = (
             "Named payloads exposed under the same exact name as π.key (for example, payloads.contract becomes π.contract). Never reference a π key absent from this map. Useful for content that is awkward to quote inside code. Prefer an object of string values; a JSON-object string is parsed.",
         }),
       ),
-      // 宿主通道：扩展在 `tool_call` 钩子里挂上 prelude，模型不该自己写。它单独过类型门禁并单独
-      // 归因，因此 prelude 出错只会报「宿主 prelude 失败」，不会污染模型代码的诊断与行号。
+      // 宿主通道：扩展在 `tool_call` 钩子里挂上 prelude，模型不该自己写。它单独过一遍类型门禁并单独
+      // 归因（出错只报「宿主 prelude 失败」），同时参与模型代码那次编译，所以它声明的符号对模型可见。
       prelude: Type.Optional(
         Type.String({
           description:
-            "Host-only guest prelude injected by an extension; type-checked in isolation and prepended at execution time",
+            "Host-only guest prelude injected by an extension; type-checked on its own and run in the guest wrapper scope ahead of this program so the program can call symbols it declares",
         }),
       ),
       resultFormat: Type.Optional(Type.Union(RESULT_FORMATS.map((value) => Type.Literal(value)))),
