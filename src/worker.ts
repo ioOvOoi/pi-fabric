@@ -17,7 +17,26 @@ const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".
 // 实测 Windows + 完整扩展套件（provider 注册 + 多个 MCP server）的启动约 34s，
 // 原 15s 窗口会在启动期内误杀所有带 model 的派发。
 // 与 Math.min(run timeout) 组合，保证短超时任务的等待不被放大。
-const MODEL_ADMISSION_TIMEOUT_MS = 90_000;
+const DEFAULT_MODEL_ADMISSION_TIMEOUT_MS = 90_000;
+
+/**
+ * admission 窗口的实际取值：默认 90s，可用 PI_FABRIC_MODEL_ADMISSION_TIMEOUT_MS 覆写（毫秒）。
+ *
+ * 为什么要留覆写口：90s 是本机实测定的，慢机器（或装了更多扩展/MCP 的环境）启动更久；一旦超过
+ * 窗口，所有带 model 的派发都会以「RPC admission timed out」整片失败，而用户手里没有旋钮，只能
+ * 等上游改代码。非法值退回默认：NaN 会让 setTimeout 立刻触发、把每次派发都判死，比不生效危险得多。
+ */
+export const modelAdmissionTimeoutMs = (
+  env: NodeJS.ProcessEnv = process.env,
+): number => {
+  const raw = env.PI_FABRIC_MODEL_ADMISSION_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "")
+    return DEFAULT_MODEL_ADMISSION_TIMEOUT_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0
+    ? Math.floor(parsed)
+    : DEFAULT_MODEL_ADMISSION_TIMEOUT_MS;
+};
 
 const spawnCli = (
   command: string,
@@ -960,7 +979,7 @@ const main = async (): Promise<void> => {
     child.stdin?.end();
   } else {
     if (options.model) {
-      modelTimer = setTimeout(() => modelControl.fail("RPC admission timed out; task was not sent"), Math.min(MODEL_ADMISSION_TIMEOUT_MS, options.timeoutMs));
+      modelTimer = setTimeout(() => modelControl.fail("RPC admission timed out; task was not sent"), Math.min(modelAdmissionTimeoutMs(), options.timeoutMs));
       modelTimer.unref();
     }
     modelControl.start();
