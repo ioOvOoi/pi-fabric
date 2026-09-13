@@ -260,13 +260,12 @@ export const typeCheckFabricCode = (
  * 键是「声明文本 + prelude 源码」：声明随当次会话的工具体系变化，prelude 由扩展按配置生成，
  * 两者都不常变，命中率很高；而 prelude 动辄几百行，每次 fabric_exec 都重查一遍是纯浪费。
  *
- * 每个键配一个独立的 FabricTypeChecker 实例：checker 内部持有增量 program，
- * 与模型代码那份门禁共用实例会让双方的增量信息互相作废。
+ * 为什么要独立 checker：checker 内部持有增量 program，与模型代码那份门禁共用实例会让双方的
+ * 增量信息互相作废，所以冷启动那一次单独 new 一个。
+ * 为什么缓存里不留 checker：命中时直接返回结果，checker 此后再没被用过；留着只是把增量 program
+ * 一并钉在内存里（4 条 prelude 就是 4 份 program），收益为零。
  */
-const guestPreludeCache = new Map<
-  string,
-  { checker: FabricTypeChecker; result: FabricTypeCheckResult }
->();
+const guestPreludeCache = new Map<string, FabricTypeCheckResult>();
 const MAX_GUEST_PRELUDES = 4;
 
 /** 宿主 prelude 的类型门禁：与模型代码完全分开，行号只相对 prelude 自己。 */
@@ -279,7 +278,7 @@ export const typeCheckGuestPrelude = (
   if (cached) {
     guestPreludeCache.delete(key);
     guestPreludeCache.set(key, cached);
-    return cached.result;
+    return cached;
   }
   const checker = new FabricTypeChecker(declarations);
   const checked = checker.check(prelude);
@@ -290,7 +289,7 @@ export const typeCheckGuestPrelude = (
     checked.errors.length > 0
       ? { errors: checked.errors }
       : { errors: [], javascript: transpileGuestPreludeBody(prelude) };
-  guestPreludeCache.set(key, { checker, result });
+  guestPreludeCache.set(key, result);
   while (guestPreludeCache.size > MAX_GUEST_PRELUDES) {
     const oldest = guestPreludeCache.keys().next().value as string | undefined;
     if (oldest === undefined) break;
