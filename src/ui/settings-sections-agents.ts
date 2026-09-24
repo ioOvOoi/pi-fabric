@@ -46,7 +46,7 @@ export const buildPrewalkSection = (
         }),
         setting("prewalk.mode", "Mode", config.prewalk.mode, {
           description:
-            "In-place temporarily switches Main to the executor, queues a hidden continuation, then returns to Main's previous model. Trajectory moves the session snapshot to a visible child executor, then queues a hidden verify-and-summarize continuation for Main when it finishes.",
+            "In-place temporarily switches Main to the executor, queues a hidden continuation, then returns to Main's previous model when that continuation settles, when a new session is still on the executor, or when prewalk is cancelled. Trajectory moves the session snapshot to a visible child executor, then queues a hidden verify-and-summarize continuation for Main when it finishes.",
           values: PREWALK_MODES,
         }),
         setting(
@@ -56,6 +56,16 @@ export const buildPrewalkSection = (
           {
             description:
               "Arm prewalk automatically at every session start and again after each completed handoff until /fabric prewalk --off cancels it for the session. Auto-arm needs prewalk.model (provider/model). Read-only turns never disarm prewalk.",
+            values: BOOLEANS,
+          },
+        ),
+        setting(
+          "prewalk.requirePlan",
+          "Plan checkpoint first",
+          config.prewalk.requirePlan ? "true" : "false",
+          {
+            description:
+              "Frontier-first planning: on the mutation boundary that would hand off, ask Main to write the plan (outcome, remaining steps, exact files, verification) and keep working on the frontier model. The handoff then fires at the next successful mutation, and Fabric delivers the recorded plan directly in the executor continuation or task. After two reminders without a plan it hands off unplanned with a warning. Disable to hand off on the first mutation, as before.",
             values: BOOLEANS,
           },
         ),
@@ -317,7 +327,7 @@ export const buildAgentsSection = (
           values: BOOLEANS,
         }),
         setting("agents.notifyOnComplete", "Notify on complete", config.agents.notifyOnComplete ? "true" : "false", {
-          description: "Post a message when a background agent completes.",
+          description: "Show background completion notices and deliver unread results to Main at a safe boundary. Results already received through wait or terminal status do not wake Main again.",
           values: BOOLEANS,
         }),
       ],

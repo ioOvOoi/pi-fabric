@@ -1,4 +1,5 @@
 import type { FabricDynamicGuestDeclarations } from "../protocol.js";
+import { JEV_GUEST_DECLARATIONS } from "../jev/guest-types.js";
 
 // These names and compatibility fields are the single source of truth for
 // generated core-override overloads. Keep them beside PiToolsApi below so an
@@ -184,6 +185,8 @@ type FabricLifecycleEventType =
   | "run.failed"
   | "run.stopped"
   | "run.timed_out"
+  | "run.resumed"
+  | "run.detached"
   | "tokens.usage"
   | "component.state";
 type FabricLifecycleDelivery = "steer" | "followUp";
@@ -356,11 +359,41 @@ interface FabricCapabilityCatalog {
   reasons: string[];
 }
 interface FabricToolsApi {
+interface FabricActionListEnvelope {
+  kind: "pi-fabric.action-list";
+  version: 1;
+  actions: FabricAction[];
+  /** Full visible-action count before paging. */
+  total: number;
+  /** True when total exceeds the returned page: more actions exist. */
+  truncated: boolean;
+  limit: number;
+}
+interface FabricActionSearchBackend {
+  requested: "semantic";
+  used: "semantic" | "lexical";
+  degraded: boolean;
+  model?: string;
+  usage?: { inputTokens: number; outputTokens: number };
+  abstained?: boolean;
+  reason?: "timeout" | "rate_limited" | "service_unavailable";
+}
+interface FabricActionSearchEnvelope {
+  kind: "pi-fabric.action-search";
+  version: 1;
+  actions: FabricAction[];
+  backend: FabricActionSearchBackend;
+}
+interface FabricToolsApi {
   providers(): Promise<Array<{ name: string; description: string }>>;
   catalog(args?: { provider?: string; limit?: number }): Promise<FabricCapabilityCatalog>;
-  list(args?: { provider?: string; namespace?: string; query?: string; limit?: number }): Promise<FabricAction[]>;
-  search(query: string): Promise<FabricAction[]>;
-  search(args: { query: string; limit?: number }): Promise<FabricAction[]>;
+  /**
+   * Capped discovery page: default 100 entries, silently truncated (hard cap
+   * 1000). A short result never proves an action is absent — confirm with
+   * search() or pass envelope: true to get totals and a truncated flag.
+   */
+  list(args?: { provider?: string; namespace?: string; query?: string; limit?: number; envelope?: boolean }): Promise<FabricAction[] | FabricActionListEnvelope>;
+  search(args: { query: string; limit?: number; searchMode?: "lexical" | "semantic" }): Promise<FabricAction[] | FabricActionSearchEnvelope>;
   describe(args: { ref: string }): Promise<FabricAction>;
   call(args: { ref: string; args?: Record<string, unknown> }): Promise<unknown>;
   progress(args: { message: string }): Promise<void>;
@@ -388,6 +421,9 @@ type FabricExtensionsApi = Record<string, FabricCapturedTool>;
 // flat edit shape ({ path, oldText, newText }) are also accepted; the runtime
 // proxy normalizes them to the canonical form before the host validates args.
 // Bash timeout is measured in seconds; timeoutMs is converted from milliseconds.
+// After executor.shellHangMs the await still resolves ok: true with a still-running
+// notice, pid, and live output path in details; background: true (alias
+// run_in_background) detaches immediately. The process keeps writing that file.
 // Extended near-miss repairs: find's name/filename/glob → pattern, write's
 // data → content, ls's folder → path, bash's script → command; numeric option
 // fields (limit/offset/context/timeout) also accept numeric strings, coerced
@@ -472,6 +508,7 @@ type PiReadOptions = { offset?: number; limit?: number; start?: number; max?: nu
 // repairable call is rejected before it ever reaches the sandbox.
 type PiShellOptions = {
   timeout?: number; timeoutMs?: number; settle?: boolean;
+  background?: boolean; run_in_background?: boolean;
   cwd?: string; workdir?: string; directory?: string; workingDirectory?: string;
 };
 type PiBashOptions = PiShellOptions;
@@ -675,6 +712,8 @@ interface FabricAgentsApi {
   handoff(args: FabricHandoffRequest): Promise<FabricHandoffResult>;
   spawn(args: FabricAgentRequest): Promise<FabricAgentHandle>;
   wait(args: FabricAgentTargetArgs): Promise<FabricAgentResult>;
+  /** Alias for wait. */
+  join(args: FabricAgentTargetArgs): Promise<FabricAgentResult>;
   status(args: FabricAgentTargetArgs): Promise<FabricAgentResult | FabricAgentHandle | FabricMainAgentInfo | FabricActorInfo | FabricParticipantInfo>;
   list(args?: { scope?: FabricParticipantScope }): Promise<Array<FabricAgentResult | FabricAgentHandle | FabricParticipantInfo>>;
   members(args?: { scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean }): Promise<FabricParticipantInfo[]>;
@@ -718,10 +757,18 @@ interface FabricAgentsApi {
   followUp(args: { id: string; message: string; data?: unknown }): Promise<{ queued: true; messageId: string; routed?: "local" | "main" | "mesh"; acknowledged?: boolean }>;
   setSteeringMode(args: { id: string; mode: "all" | "one-at-a-time" }): Promise<{ queued: true; messageId: string }>;
   setFollowUpMode(args: { id: string; mode: "all" | "one-at-a-time" }): Promise<{ queued: true; messageId: string }>;
+  /** Advisory compaction of a running Pi-runner child at its next safe turn boundary. */
+  compact(args: { id: string; instructions?: string }): Promise<{ queued: true; messageId: string }>;
   actorStatus(args: FabricAgentTargetArgs): Promise<FabricActorInfo>;
   actors(): Promise<FabricActorInfo[]>;
   messages(args: { id: string; limit?: number }): Promise<FabricActorMessage[]>;
   remove(args: { id: string }): Promise<{ removed: boolean }>;
+  /** Drop an actor's mailbox history without stopping the actor. */
+  clearMessages(args: { id: string }): Promise<FabricActorInfo>;
+  /** Stamp a global template into the current project as a fresh live actor with no inherited history. */
+  "import"(args: { id?: string; name?: string; as?: string }): Promise<FabricActorInfo>;
+  /** Export a live project actor's definition to the global registry as a project-independent template. */
+  "export"(args: { id: string; overwrite?: boolean }): Promise<FabricActorRequest & { id: string; createdAt: number; updatedAt: number }>;
   log(args: {
     id: string;
     type?: "session" | "run" | "all";
@@ -1205,11 +1252,57 @@ interface FabricComponentInfo {
   createdAt: number;
   updatedAt: number;
 }
+interface FabricComponentEntry {
+  id: string;
+  component: string;
+  config?: unknown;
+  disabled?: boolean;
+}
+interface FabricComponentDefinitionInfo {
+  name: string;
+  description?: string;
+  revision: number;
+  configSchema?: Record<string, unknown>;
+  requirements: string[];
+  provisions: string[];
+}
+interface FabricComponentConfigSource {
+  scope: "global" | "project";
+  path: string;
+  trusted: boolean;
+  present: boolean;
+  selected: boolean;
+}
+interface FabricComponentConfigurationInfo {
+  sources: FabricComponentConfigSource[];
+  warnings: string[];
+  sessionOverrides: string[];
+  removalPolicy: "drain";
+  error?: string;
+}
+interface FabricComponentChangeRequest {
+  scope?: "session" | "global" | "project";
+  entries?: FabricComponentEntry[];
+  remove?: string[];
+  reset?: string[];
+}
+interface FabricComponentChangePlan {
+  revision: string;
+  request: Required<FabricComponentChangeRequest>;
+  changes: Array<{ id: string; operation: "add" | "replace" | "remove"; component: string; requirements: string[]; provisions: string[] }>;
+  warnings: string[];
+  sources: FabricComponentConfigSource[];
+}
 interface FabricComponentsApi {
   list(): Promise<{
-    definitions: Array<{ name: string; description?: string; revision: number; requirements: string[]; provisions: string[] }>;
+    definitions: FabricComponentDefinitionInfo[];
     components: FabricComponentInfo[];
+    configuration: FabricComponentConfigurationInfo;
   }>;
+  describe(args: { component: string }): Promise<FabricComponentDefinitionInfo & { instances: FabricComponentInfo[] }>;
+  plan(args: FabricComponentChangeRequest): Promise<FabricComponentChangePlan>;
+  apply(args: FabricComponentChangeRequest & { expectedRevision: string }): Promise<{ components: FabricComponentInfo[]; configuration: FabricComponentConfigurationInfo; scope: "session" | "global" | "project" }>;
+  reconcile(): Promise<{ components: FabricComponentInfo[]; configuration: FabricComponentConfigurationInfo }>;
   status(args: { id: string }): Promise<FabricComponentInfo>;
   graph(): Promise<{
     components: FabricComponentInfo[];
@@ -1230,6 +1323,32 @@ interface FabricCompactApi {
   }): Promise<{ requested: true; intent: FabricCompactPendingIntent }>;
   status(): Promise<{ pending?: FabricCompactPendingIntent; last?: FabricCompactLastCommit }>;
   cancel(): Promise<{ cancelled: true }>;
+}
+
+interface FabricPrewalkFileIdentityStatus {
+  path: string;
+  loadedSha256: string;
+  diskSha256: string;
+  stale: boolean;
+}
+interface FabricPrewalkApi {
+  plan(args: {
+    outcome: string;
+    steps: string[];
+    verification: string[];
+    risks: string;
+  }): Promise<{ recorded: true; readiness: "ready"; plan: string }>;
+  status(): Promise<{
+    state: "idle" | "armed" | "handing_off" | "continuation_pending";
+    planRequired: boolean;
+    planReady: boolean;
+    planPrompts: number;
+    claimedReadiness: "planned" | "disabled" | "unplanned" | null;
+    runtime?: {
+      entry: FabricPrewalkFileIdentityStatus | null;
+      lazyRuntime: FabricPrewalkFileIdentityStatus | null;
+    };
+  }>;
 }
 
 interface FabricWorkflowAgentOptions extends Omit<FabricAgentRequest, "task"> {
@@ -1285,6 +1404,8 @@ declare const state: FabricStateApi;
 declare const schema: FabricSchemaApi;
 declare const components: FabricComponentsApi;
 declare const compact: FabricCompactApi;
+declare const prewalk: FabricPrewalkApi;
+${JEV_GUEST_DECLARATIONS}
 declare const council: FabricCouncilApi;
 declare const workflow: FabricWorkflowApi;
 declare function agent<T = string>(prompt: string, options?: FabricWorkflowAgentOptions): Promise<T>;
@@ -1305,11 +1426,17 @@ interface FabricConsole {
 }
 declare const console: FabricConsole;
 declare const π: Readonly<Record<string, string>>;
+// Process runtimes only: node/bun children bridge native-module imports;
+// quickjs has no module loader and rejects __fabricImport at runtime.
+declare function __fabricImport(specifier: string): Promise<any>;
 declare function print(...args: unknown[]): void;
 declare function setTimeout(handler: (...args: any[]) => void, timeout?: number): number;
 declare function clearTimeout(handle: number): void;
 declare function setInterval(handler: (...args: any[]) => void, timeout?: number): number;
 declare function clearInterval(handle: number): void;
+// Process runtimes only: the bun-process child binds the host's real Bun
+// module namespace as __bun; undefined under node-process and quickjs.
+declare const __bun: any;
 `;
 
 const FULL_CODE_GLOBAL_DECLARATIONS = [

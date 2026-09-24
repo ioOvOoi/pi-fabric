@@ -19,6 +19,7 @@ const key = (model: ModelIdentity): string => `${model.provider}/${model.id}`;
 // after startup, then read actual state: set_model's response echoes its input
 // model even if a model_select extension switched away again.
 export class PiModelControl {
+  #awaitingStartup = true;
   #expected: ModelIdentity | undefined;
   #pending: { id: string; command: string } | undefined;
   #sequence = 0;
@@ -55,11 +56,19 @@ export class PiModelControl {
       this.io.admitted();
       return;
     }
-    const separator = this.requested.indexOf("/");
-    if (separator > 0 && separator < this.requested.length - 1) {
+    // Pi opens its RPC input only after extension factories and session_start
+    // handlers finish. A correlated response, not spawn or startup UI output,
+    // marks readiness; the worker's overall timeout bounds the entire handshake.
+    this.#send("get_state");
+  }
+
+  #resolveModel(): void {
+    const requested = this.requested!;
+    const separator = requested.indexOf("/");
+    if (separator > 0 && separator < requested.length - 1) {
       this.#expected = {
-        provider: this.requested.slice(0, separator),
-        id: this.requested.slice(separator + 1),
+        provider: requested.slice(0, separator),
+        id: requested.slice(separator + 1),
       };
       this.#select();
     } else {
@@ -94,7 +103,10 @@ export class PiModelControl {
       this.fail(`${command}: ${typeof event.error === "string" ? event.error : "invalid or rejected RPC response"}`);
       return true;
     }
-    if (command === "get_available_models") {
+    if (this.#awaitingStartup) {
+      this.#awaitingStartup = false;
+      this.#resolveModel();
+    } else if (command === "get_available_models") {
       const models = object(event.data)?.models;
       const matches = Array.isArray(models)
         ? models.map(identity).filter((model): model is ModelIdentity => model?.id === this.requested)

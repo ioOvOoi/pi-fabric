@@ -92,4 +92,20 @@ describe("prewalk prompt isolation", () => {
     expect(end).toBeGreaterThan(start);
     expect(source.slice(start, end)).toContain("state.prewalk.settleTask");
   });
+
+  it("restores the borrowed Main model when a session starts", () => {
+    const source = fs.readFileSync(path.join(process.cwd(), "src", "index.ts"), "utf8");
+    const start = source.indexOf('pi.on("session_start"');
+    const end = source.indexOf('pi.on("session_tree"', start);
+
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const handler = source.slice(start, end);
+    expect(handler).toContain("restoreBorrowedInPlaceMain");
+    // Recovery must precede the eager activation that may auto-arm: a restarted
+    // process otherwise arms on the executor before Main can snap back.
+    expect(handler.indexOf("restoreBorrowedInPlaceMain")).toBeLessThan(
+      handler.indexOf("state.ensure(context)"),
+    );
+  });
 });

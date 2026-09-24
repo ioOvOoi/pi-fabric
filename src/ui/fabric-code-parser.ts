@@ -1,5 +1,9 @@
-import { parser as pythonParser } from "@lezer/python";
+import { createRequire } from "node:module";
+import type { SyntaxNodeRef } from "@lezer/common";
 import type { FabricKernel } from "../runtime/kernel.js";
+
+const require = createRequire(import.meta.url);
+let pythonParser: typeof import("@lezer/python")["parser"] | undefined;
 
 export interface FabricWriteBinding {
   path: string;
@@ -43,8 +47,8 @@ const readEscape = (source: string, index: number): { value: string; next: numbe
 // same token shape as object/dictionary fields for the shared title renderer.
 const tokenizePython = (source: string): Token[] => {
   const tokens: Token[] = [];
-  pythonParser.parse(source).iterate({
-    enter(node) {
+  (pythonParser ??= (require("@lezer/python") as typeof import("@lezer/python")).parser).parse(source).iterate({
+    enter(node: SyntaxNodeRef) {
       if (node.name === "Comment" || node.name === "FormatString") return false;
       const text = source.slice(node.from, node.to);
       if (node.name === "String") {

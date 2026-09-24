@@ -151,6 +151,8 @@ class _Proxy:
             ref = "fabric.$" + name
         if ref in ("pi.bash", "pi.powershell") and "settle" in args and type(args["settle"]) is not bool:
             raise TypeError("pi shell settle must be a boolean; use settle=True or settle=False")
+        if ref in ("pi.bash", "pi.powershell") and "background" in args and type(args["background"]) is not bool:
+            raise TypeError("pi shell background must be a boolean; use background=True or background=False")
         settle = ref in ("pi.bash", "pi.powershell") and args.pop("settle", False) is True
         try:
             return await _call(ref, args)
@@ -263,7 +265,7 @@ async def _main():
         function.body = parsed.body or function.body
         function.end_lineno = max(2, len(source.splitlines()))
         program = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
-        namespace = {name: _Proxy(name) for name in ("pi", "tools", "mcp", "extensions", "memory", "state", "schema", "components", "compact", "agents", "mesh")}
+        namespace = {name: _Proxy(name) for name in ("pi", "tools", "mcp", "extensions", "memory", "state", "schema", "components", "compact", "prewalk", "agents", "mesh")}
         payloads = _Payloads(request.get("strings", {}))
         namespace.update({"π": payloads, "payloads": payloads, "asyncio": asyncio, "__name__": "__fabric_guest__"})
         exec(compile(program, "fabric-exec.py", "exec"), namespace)

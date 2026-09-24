@@ -34,7 +34,7 @@ r = await pi.bash(command="git status --short", settle=True)
 return {"ok": r["ok"], "output": r["output"], "exitCode": r.get("exitCode")}
 ```
 
-Shell nonzero exits raise unless `settle=True`; timeout, cancellation, security and approval failures still raise. Shell `timeout` is seconds. No stdin option: write content to a file first, then use its path. Do not interpolate untrusted content into shell commands.
+Shell nonzero exits raise unless `settle=True`; timeout, cancellation, security and approval failures still raise. Shell `timeout` is seconds. `background=True` (alias `run_in_background`) returns immediately with `ok: True`, a pid, and a live output path while the process keeps running — do not poll; `pi.read` the path when you need output, or `kill <pid>`. Nested shells that exceed `executor.shellHangMs` (default 2 minutes) auto-spill the same way. No stdin option: write content to a file first, then use its path. Do not interpolate untrusted content into shell commands.
 
 Use top-level `payloads` for multiline content. Only exact keys supplied in this call exist: `π.body` or `payloads["body"]`. `π` is an attribute object; `payloads` is a separate dict. For a supplied `body` key, write with `await pi.write(path="notes.txt", content=π.body)`. Edit with `await pi.edit(path="notes.txt", edits=[{"oldText": "before", "newText": "after"}])`. Coalesce independent edits from one snapshot; use `all=True` only for intentional repeated anchors.
 
@@ -58,6 +58,16 @@ Inspect `inputSchema` and `outputSchema` before calling a dynamic action. `await
 `state` records claims and verification. Under Schema enforce, protected changes must use `schema.hypothesize`, `schema.verify`, and `schema.commit` in one invocation; do not bypass host gates. `compact.request` requests compaction rather than running an alternate executor.
 
 Advanced agent/mesh workflows require explicit user intent. Branch pointers: read `<skill-dir>/references/agents.md` for child agents and persistent actors, `<skill-dir>/references/mesh.md` for coordination, and `<skill-dir>/references/mcp.md` for MCP naming/management only when the task needs those surfaces. Peer means another root Pi session: query `await agents.peers()` first, not child-agent lists. Agent calls inherit this kernel unless a child's language is explicitly selected; that does not change this program's language. Omit agent `timeoutMs` unless requesting longer than the configured default. Use discovered host actions with ordinary loops and `asyncio.gather`; use the selected Python skill tree, never launch another interpreter to run workflow programs.
+
+## Jev judgments and programs
+
+`wait` is canonical for both providers. `agents.join(id=...)` aliases `agents.wait(id=...)`; `tools.call(ref="jev.join", args={"id": ...})` aliases `jev.wait`. Each alias preserves its provider's lifecycle and notification behavior.
+
+Use `await tools.call(ref="jev.evaluate", args={...})` for typed Choice/Noul/Score judgments. `jev.run`/`jev.spawn` take `{"program": ..., "input": ...}`; `jev.status` takes optional `{"id": ..., "after": ...}`, and `jev.wait`/`jev.stop` take `{"id": ...}`. Results are dictionaries: evaluate returns `model`, `answers`, and token `usage`; run/wait/stop return a run envelope with `id`, `state`, `result`/`error`, counts, usage, and bounded progress. Spawn initially returns `running` and optionally accepts `observe` for event-driven Main-turn advisors. Inside the TypeScript artifact, `program.nextEvent()` waits without polling; `program.advise({eventId,message})` requires `jev.advise` plus explicit delivery. The public `jev.advise` call takes `{"id": ..., "eventId": ..., "message": ...}` and returns `{"delivered": bool, "reason": ...}` (reason only when suppressed); agent approvals, freshness, and feedback gates apply. Return the observer ID without waiting inside Main. Status without id reports credential presence and run summaries without retrieving a key.
+
+The outer Fabric program remains Python. Jev's `program.code` is a TypeScript artifact executed by its dedicated QuickJS manager, not a Python runtime or shell escape hatch. Runs are session-owned, not restart-durable; cancelling wait cancels only the wait, and stop cannot roll back effects. Credentials stay host-side via `/login jev`/`TYPESAFE_API_KEY` for direct aliases, the existing openrouter credential for `typesafe/…` ids, the existing `vercel-ai-gateway` credential for `typesafe-ai/…` ids, or a trusted command. Jev is unavailable in Schema enforce and managed hosts. State sent to TypeSafe consumes credits; confidence is not authorization.
+
+Recommend `/skill:fabric-jev` for guided authoring; never load it autonomously. Only after direct invocation, `<skill-dir>/../fabric-jev/SKILL.md` is its workflow pointer. `<skill-dir>/../../../docs/jev.md` is a branch pointer for exact host contracts, limits, and browser composition.
 
 ## Recovery
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { SessionEntry, SessionMessageEntry } from "@earendil-works/pi-coding-agent";
+import type { JsonObject } from "@earendil-works/pi-ai";
 import { normalizeEntries } from "../src/compaction/normalize.js";
 import { project } from "../src/compaction/projections.js";
 import { generateProbes, checkProbes, qaReport } from "../src/compaction/qa.js";
@@ -21,11 +22,11 @@ const user = (text: string): SessionMessageEntry => ({
 });
 
 const textPart = (text: string): { type: "text"; text: string } => ({ type: "text", text });
-const toolCallPart = (id: string, name: string, args: Record<string, unknown>): {
+const toolCallPart = (id: string, name: string, args: JsonObject): {
   type: "toolCall";
   id: string;
   name: string;
-  arguments: Record<string, unknown>;
+  arguments: JsonObject;
 } => ({ type: "toolCall", id, name, arguments: args });
 
 type AssistantPart = ReturnType<typeof textPart> | ReturnType<typeof toolCallPart>;
@@ -128,7 +129,7 @@ describe("compaction reconstruction QA", () => {
     const checked = checkProbes(fixture.summary, probes);
     const report = qaReport(fixture.events, fixture.events.length, fixture.summary);
 
-    expect(probes.some((probe) => probe.class === "content" && probe.id === "goal")).toBe(true);
+    expect(probes.some((probe) => probe.class === "content" && probe.id.startsWith("dialogue:"))).toBe(true);
     expect(probes.some((probe) => probe.class === "content" && probe.answer === "compaction.md")).toBe(true);
     expect(probes.some((probe) => probe.class === "content" && probe.answer === "read src/missing.ts: ENOENT: no such file or directory")).toBe(true);
     expect(probes.some((probe) => probe.id.startsWith("commit:"))).toBe(false);

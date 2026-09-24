@@ -4,6 +4,8 @@ Use native dictionaries and await host methods. Every call accepts one dictionar
 
 ## One-shot children
 
+`agents.wait(id=...)` is canonical; `agents.join(id=...)` is its alias with the same arguments, result, progress, and detached-completion notification behavior. Jev likewise uses canonical `jev.wait` and alias `jev.join` through `tools.call`.
+
 `agents.run` returns a dictionary with id, runner, optional kernel, status, text, optional value/error, usage, turns, toolCalls and runnerSessionId. Check `status == "completed"` before relying on text/value; a returned failure status does not raise automatically. Structured schema output is in `value`.
 
 ```python
@@ -21,7 +23,7 @@ Request fields include task, name, runner, kernel, transport, model, persona, th
 - `worktree=True` creates a retained dedicated Git worktree in the selected repository. Verify canonical repository identity, never infer it from directory naming. Abort with zero changes on mismatch. Partition concurrent edit ownership; never edit shared files concurrently. Inspect and stop active work before cleanup; leave unrelated worktrees alone.
 - `schema` requests validated structured output. `thinking` is configured/clamped reasoning effort.
 
-`agents.spawn` returns a handle; `wait`, `status`, `stop`, and `cleanup` take its id. Detached runs notify Main on terminal completion by default; `wait` makes the run foreground and suppresses that notification. `residency="durable"` is a spawn-only opt-in to outlive Main, requiring trusted mesh and no Schema enforce.
+`agents.spawn` returns a handle; `wait`, `status`, `stop`, and `cleanup` take its id. Unread detached results are batched after the current tool turn, or wake idle Main once; concise UI notices appear immediately. `wait`/`join` and terminal `status` acknowledge results and retract pending notifications, even after completion. Running status and UI/list polling do not acknowledge them. Return the relevant outcome to Main from your program; prefer `wait` over status polling. Escape/error parks results until new input. `residency="durable"` is a spawn-only opt-in to outlive Main, requiring trusted mesh and no Schema enforce; unread deliveries and acknowledgments survive reconnects.
 
 ```python
 handle = await agents.spawn(task="Map the persistence layer.", tools=["read", "grep", "find", "ls"])
@@ -61,3 +63,5 @@ return await agents.create(name="auth-supervisor", instructions="Watch until the
 Use `await agents.run(task="...", runner="pi", recursive=True)` only for oversized context; plain children handle bounded leaves. Host maxDepth (0 disables spawning), approvals, concurrency, and budget limits remain active. Recursion delegates agent risk only, not filesystem/network/execute permissions. Keep durable context in mesh keys or project-relative files plus digests, not whole-corpus child prompts.
 
 `agents.handoff` without a predicate schedules an explicit Pi-to-Pi trajectory handoff at the completed outer fabric_exec boundary; later calls in the program still run. It is not a subroutine result. Use host schemas and a canonical target model; no Python guest predicate callbacks. Preserve successful effects rather than retrying the original program blindly.
+
+A running trajectory executor may receive one hidden `pi-fabric-handoff-continuation` after a failed nested handoff. Finish the original assignment directly in the same workspace, preserve completed work, and verify the remainder instead of returning only a failure report. Do not retry delegation, spawn a replacement, or raise limits. Fabric cancels the local Prewalk arm and preserves the failed boundary, original deadline, permissions, and token accounting. Explicit stops, cancellation, timeouts, and token-limit termination stay terminal. Main continues to report terminal failures and propose a next step; it does not take over unprompted.

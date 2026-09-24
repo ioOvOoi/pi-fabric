@@ -1,4 +1,12 @@
+import type { ProviderOperations, ProviderOperation } from "./provider-operations.js";
+import { CapabilityAuthority } from "../verified/authority.js";
 import { randomUUID } from "node:crypto";
+import { effectConflictsBetween, registrationEffect, summarizeEffects } from "../components/effect-policy.js";
+
+/** Effective page size for registry list(): caller default 100, hard cap 1000.
+ *  Exported so guest discovery surfaces slice identically to the registry. */
+export const fabricActionListLimit = (limit?: number): number =>
+  Math.max(1, Math.min(limit ?? 100, 1_000));
 import { repairCatalogInput, validateCatalogArgs, validationMessage } from "./action-arguments.js";
 import {
   MAX_AUDIT_VALUE_CHARS,
@@ -9,7 +17,7 @@ import {
   previewArgs,
   previewResult,
 } from "./action-result.js";
-import { runAbortable, settleWithin } from "../async-settlement.js";
+import { runAbortable, settleWithin, throwIfAborted } from "../async-settlement.js";
 import type {
   FabricCapabilityRequirement,
   FabricComponentProviderLease,
@@ -156,6 +164,41 @@ export const NESTED_TOOL_CALL_ID_PREFIX = FABRIC_NESTED_TOOL_CALL_ID_PREFIX;
 
 const providerNamePattern = /^[a-z][a-z0-9_-]*$/;
 
+/** structuredClone detaches ordinary nested references, but deliberately shares
+ * SharedArrayBuffer backing memory. Such payloads cannot be approved as stable
+ * snapshots, including when hidden in maps, views, cycles or Error.cause.
+ */
+const snapshotArguments = (args: Record<string, unknown>): Record<string, unknown> => {
+  const snapshot = structuredClone(args);
+  const pending: unknown[] = [snapshot];
+  const seen = new WeakSet<object>();
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (value === null || typeof value !== "object" || seen.has(value)) continue;
+    seen.add(value);
+    if (typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer) {
+      throw new FabricTraceSafeError("Fabric argument snapshots cannot contain shared memory");
+    }
+    // WebAssembly.Memory has no own data properties; its backing buffer is
+    // nevertheless shared by structuredClone and must be inspected explicitly.
+    if (Object.prototype.toString.call(value) === "[object WebAssembly.Memory]") {
+      pending.push((value as { buffer: unknown }).buffer);
+      continue;
+    }
+    if (ArrayBuffer.isView(value)) {
+      pending.push(value.buffer);
+      continue;
+    }
+    if (value instanceof Map) for (const [key, entry] of value) pending.push(key, entry);
+    if (value instanceof Set) for (const entry of value) pending.push(entry);
+    for (const key of Reflect.ownKeys(value)) {
+      const property = Object.getOwnPropertyDescriptor(value, key);
+      if (property && "value" in property) pending.push(property.value);
+    }
+  }
+  return snapshot;
+};
+
 const resolveDescriptor = (
   provider: FabricProvider,
   descriptor: FabricActionDescriptor,
@@ -185,32 +228,80 @@ const discoveryTerms = (value: string): string[] =>
   [...value.normalize("NFKC").matchAll(/[\p{L}\p{N}_]+/gu)]
     .map((match) => match[0].toLowerCase());
 
+export const scoreActionSearch = (
+  query: string,
+  action: {
+    ref: string;
+    name: string;
+    description: string;
+    provider: string;
+    namespace?: string;
+    inputSchema: unknown;
+  },
+  providerDescription = "",
+): number => {
+  const normalizedQuery = query.normalize("NFKC").trim().toLowerCase();
+  if (!normalizedQuery) return 0;
+  const queryTerms = [...new Set(discoveryTerms(normalizedQuery))];
+  const ref = action.ref.normalize("NFKC").toLowerCase();
+  const name = action.name.normalize("NFKC").toLowerCase();
+  const description = action.description.normalize("NFKC").toLowerCase();
+  const provider = action.provider.normalize("NFKC").toLowerCase();
+  const providerBody = providerDescription.normalize("NFKC").toLowerCase();
+  const namespace = (action.namespace ?? "").normalize("NFKC").toLowerCase();
+  const schema = JSON.stringify(action.inputSchema ?? {}).normalize("NFKC").toLowerCase();
+  const tokenSets = {
+    ref: new Set(discoveryTerms(ref)),
+    name: new Set(discoveryTerms(name)),
+    description: new Set(discoveryTerms(description)),
+    provider: new Set(discoveryTerms(provider)),
+    providerBody: new Set(discoveryTerms(providerBody)),
+    namespace: new Set(discoveryTerms(namespace)),
+    schema: new Set(discoveryTerms(schema)),
+  };
+  const fields = Object.values(tokenSets);
+  let score = 0;
+  if (ref === normalizedQuery) score += 1_000;
+  if (name === normalizedQuery) score += 800;
+  if (ref.startsWith(normalizedQuery)) score += 300;
+  else if (ref.includes(normalizedQuery)) score += 120;
+  if (description.includes(normalizedQuery)) score += 40;
+  if (providerBody.includes(normalizedQuery)) score += 20;
+  if (schema.includes(normalizedQuery)) score += 10;
+  let matchedTerms = 0;
+  for (const term of queryTerms) {
+    const matched = fields.some((field) => field.has(term));
+    if (!matched) continue;
+    matchedTerms += 1;
+    if (tokenSets.ref.has(term) || tokenSets.name.has(term)) score += 30;
+    if (tokenSets.provider.has(term)) score += 20;
+    if (tokenSets.description.has(term)) score += 8;
+    if (tokenSets.providerBody.has(term)) score += 4;
+    if (tokenSets.namespace.has(term)) score += 6;
+    if (tokenSets.schema.has(term)) score += 2;
+  }
+  if (queryTerms.length > 0 && matchedTerms === queryTerms.length) score += 15;
+  return score;
+};
+
 const conflictBetween = (
   left: FabricActionEffect,
   right: FabricActionEffect,
 ): { resources: string[]; reason: FabricEffectConflict["reason"] } | undefined => {
-  if (left.kind === "none" || right.kind === "none") return undefined;
-  const resources = (effect: FabricActionEffect): string[] =>
-    [...new Set((effect.resources ?? []).filter(
-      (resource): resource is string => typeof resource === "string" && resource.length > 0,
-    ).map((resource) => resource.slice(0, 256)))].slice(0, 64);
-  const leftResources = resources(left);
-  const rightResources = resources(right);
-  if (leftResources.length === 0 || rightResources.length === 0) {
-    if (left.ordering === "commutative" && right.ordering === "commutative") return undefined;
-    return { resources: ["*"], reason: "unknown_resource" };
-  }
-  const rightSet = new Set(rightResources);
-  const overlap = leftResources.filter((resource) => rightSet.has(resource)).sort();
-  if (overlap.length === 0) return undefined;
-  if (left.ordering === "commutative" && right.ordering === "commutative") return undefined;
-  return { resources: overlap, reason: "shared_resource" };
+  return effectConflictsBetween(
+    summarizeEffects([registrationEffect({ label: "left", ...left })]),
+    summarizeEffects([registrationEffect({ label: "right", ...right })]),
+  )[0];
 };
 
 export class ActionRegistry {
+  readonly #shutdown = new AbortController();
+  readonly #views = new WeakMap<FabricCommittedCapabilityView, { controller: AbortController; signal: AbortSignal; authority: CapabilityAuthority }>();
+  #operations: Promise<ProviderOperations> | undefined;
   readonly #providerBindings = new FabricProviderBindings();
   readonly #activeEffects = new Map<string, { ref: string; effect: FabricActionEffect }>();
   readonly #unavailable = new Map<string, string>();
+  #unavailableResolver: ((name: string) => string | undefined) | undefined;
   #speculation: FabricSpeculationRuntime | undefined;
   #speculationEligibility: ((action: ResolvedFabricAction) => boolean) | undefined;
 
@@ -239,6 +330,7 @@ export class ActionRegistry {
     provider: FabricProvider,
     options: { overwrite?: boolean; staged?: boolean } = {},
   ): FabricComponentProviderLease {
+    if (this.#shutdown.signal.aborted) throw new Error("Fabric registry is closed");
     if (!providerNamePattern.test(provider.name)) {
       throw new Error(`Invalid Fabric provider name: ${provider.name}`);
     }
@@ -265,6 +357,10 @@ export class ActionRegistry {
     return this.#providerBindings.has(name);
   }
 
+  setUnavailableResolver(resolve: (name: string) => string | undefined): void {
+    this.#unavailableResolver = resolve;
+  }
+
   markUnavailable(name: string, reason: string): void {
     if (!providerNamePattern.test(name)) {
       throw new Error(`Invalid Fabric provider name: ${name}`);
@@ -285,8 +381,12 @@ export class ActionRegistry {
     return this.#providerBindings.unregister(name);
   }
 
-  providers(): Array<{ name: string; description: string }> {
-    return this.#providerBindings.providers()
+  providers(context?: FabricInvocationContext): Array<{ name: string; description: string }> {
+    if (context) this.#scopeContext(context);
+    const visible = context?.capabilityView
+      ? [...new Set(this.#viewAuthority(context.capabilityView).bindings().map(value => this.#providerBindings.binding(value.providerBindingId)?.provider).filter((provider): provider is FabricProvider => Boolean(provider)))]
+      : this.#providerBindings.providers();
+    return visible
       .map((provider) => ({ name: provider.name, description: provider.description }))
       .sort((left, right) => left.name.localeCompare(right.name));
   }
@@ -315,6 +415,7 @@ export class ActionRegistry {
    * the loose declarations stand for that execution.
    */
   async guestTypeSources(context: FabricInvocationContext): Promise<FabricGuestTypeSources> {
+    context = this.#scopeContext(context);
     const sources: FabricGuestTypeSources = {};
     if (context.capabilityView) {
       const actions = await this.list({ limit: 1_000 }, context);
@@ -407,30 +508,32 @@ export class ActionRegistry {
   // carry-forward read the live contract. Capability-view paths stay
   // declared everywhere (see describe): committed views pin declared
   // digests, and a surface activation must never invalidate them.
-  async list(
+  async listDetailed(
     request: FabricProviderListRequest & { provider?: string; declared?: boolean },
     context: FabricInvocationContext,
-  ): Promise<ResolvedFabricAction[]> {
+  ): Promise<{ actions: ResolvedFabricAction[]; total: number; truncated: boolean }> {
+    context = this.#scopeContext(context);
     if (context.capabilityView) {
-      const refs = Object.keys(context.capabilityView.bindings)
+      const refs = this.#viewAuthority(context.capabilityView).bindings().map(binding => binding.ref)
         .filter((ref) => !request.provider || ref.startsWith(`${request.provider}.`))
         .filter((ref) => request.declared || !activeQuarantinedRefNames().has(ref))
         .sort();
       const actions = await Promise.all(refs.map((ref) => this.describe(ref, context)));
       const query = request.query?.normalize("NFKC").trim().toLowerCase();
-      return actions
+      const filtered = actions
         .filter((action) => !request.namespace || action.namespace === request.namespace)
         .filter((action) =>
           !query || `${action.ref} ${action.description}`.toLowerCase().includes(query),
-        )
-        .slice(0, Math.max(1, Math.min(request.limit ?? 100, 1_000)));
+        );
+      const page = filtered.slice(0, fabricActionListLimit(request.limit));
+      return { actions: page, total: filtered.length, truncated: filtered.length > page.length };
     }
     const providers = request.provider
       ? [this.#requireProvider(request.provider)]
       : this.#providerBindings.providers();
     const lists = await Promise.all(
       providers.map(async (provider) => {
-        const descriptors = await provider.list(request, context);
+        const descriptors = await runAbortable(context.signal, () => this.#providerBindings.trackProvider(provider, () => provider.list(request, context)));
         return descriptors
           .filter(
             (descriptor) =>
@@ -453,8 +556,16 @@ export class ActionRegistry {
           });
       }),
     );
-    const limit = Math.max(1, Math.min(request.limit ?? 100, 1_000));
-    return lists.flat().slice(0, limit);
+    const all = lists.flat();
+    const page = all.slice(0, fabricActionListLimit(request.limit));
+    return { actions: page, total: all.length, truncated: all.length > page.length };
+  }
+  async list(
+    request: FabricProviderListRequest & { provider?: string; declared?: boolean },
+    context: FabricInvocationContext,
+  ): Promise<ResolvedFabricAction[]> {
+    const { actions } = await this.listDetailed(request, context);
+    return actions;
   }
 
   async catalog(
@@ -465,9 +576,10 @@ export class ActionRegistry {
       includeProvider?: (provider: string) => boolean;
     } = {},
   ): Promise<FabricCapabilityCatalog> {
+    context = this.#scopeContext(context);
     const providers = (context.capabilityView
       ? [...new Map(
-          Object.values(context.capabilityView.bindings).flatMap((pinned) => {
+          this.#viewAuthority(context.capabilityView).bindings().flatMap((pinned) => {
             const binding = this.#providerBindings.binding(pinned.providerBindingId);
             return binding ? [[binding.name, binding.provider] as const] : [];
           }),
@@ -483,7 +595,7 @@ export class ActionRegistry {
         provider,
         actions: context.capabilityView
           ? await this.list({ provider: provider.name, limit: 1_000 }, context)
-          : (await provider.list({}, context))
+          : (await runAbortable(context.signal, () => this.#providerBindings.trackProvider(provider, () => provider.list({}, context))))
               .filter(
                 (descriptor) =>
                   !activeQuarantinedRefNames().has(`${provider.name}.${descriptor.name}`),
@@ -551,52 +663,16 @@ export class ActionRegistry {
   ): Promise<ResolvedFabricAction[]> {
     const normalizedQuery = query.normalize("NFKC").trim().toLowerCase();
     if (!normalizedQuery) return [];
-    const queryTerms = [...new Set(discoveryTerms(normalizedQuery))];
     const listed = await this.list({ limit: 1_000 }, context);
     return listed
-      .map((action) => {
-        const providerDescription =
-          this.#providerBindings.current(action.provider)?.provider.description ?? "";
-        const ref = action.ref.normalize("NFKC").toLowerCase();
-        const name = action.name.normalize("NFKC").toLowerCase();
-        const description = action.description.normalize("NFKC").toLowerCase();
-        const provider = action.provider.normalize("NFKC").toLowerCase();
-        const providerBody = providerDescription.normalize("NFKC").toLowerCase();
-        const namespace = (action.namespace ?? "").normalize("NFKC").toLowerCase();
-        const schema = JSON.stringify(action.inputSchema).normalize("NFKC").toLowerCase();
-        const tokenSets = {
-          ref: new Set(discoveryTerms(ref)),
-          name: new Set(discoveryTerms(name)),
-          description: new Set(discoveryTerms(description)),
-          provider: new Set(discoveryTerms(provider)),
-          providerBody: new Set(discoveryTerms(providerBody)),
-          namespace: new Set(discoveryTerms(namespace)),
-          schema: new Set(discoveryTerms(schema)),
-        };
-        const fields = Object.values(tokenSets);
-        let score = 0;
-        if (ref === normalizedQuery) score += 1_000;
-        if (name === normalizedQuery) score += 800;
-        if (ref.startsWith(normalizedQuery)) score += 300;
-        else if (ref.includes(normalizedQuery)) score += 120;
-        if (description.includes(normalizedQuery)) score += 40;
-        if (providerBody.includes(normalizedQuery)) score += 20;
-        if (schema.includes(normalizedQuery)) score += 10;
-        let matchedTerms = 0;
-        for (const term of queryTerms) {
-          const matched = fields.some((field) => field.has(term));
-          if (!matched) continue;
-          matchedTerms += 1;
-          if (tokenSets.ref.has(term) || tokenSets.name.has(term)) score += 30;
-          if (tokenSets.provider.has(term)) score += 20;
-          if (tokenSets.description.has(term)) score += 8;
-          if (tokenSets.providerBody.has(term)) score += 4;
-          if (tokenSets.namespace.has(term)) score += 6;
-          if (tokenSets.schema.has(term)) score += 2;
-        }
-        if (queryTerms.length > 0 && matchedTerms === queryTerms.length) score += 15;
-        return { action, score };
-      })
+      .map((action) => ({
+        action,
+        score: scoreActionSearch(
+          normalizedQuery,
+          action,
+          this.#providerBindings.current(action.provider)?.provider.description ?? "",
+        ),
+      }))
       .filter((entry) => entry.score > 0)
       .sort(
         (left, right) =>
@@ -607,6 +683,7 @@ export class ActionRegistry {
   }
 
   async describe(ref: string, context: FabricInvocationContext): Promise<ResolvedFabricAction> {
+    context = this.#scopeContext(context);
     if (ref.includes(".")) {
       const { provider, actionName, expectedDescriptorHash } = this.#parseRef(
         ref,
@@ -629,7 +706,7 @@ export class ActionRegistry {
     }
     if (context.capabilityView) {
       const pinned = await Promise.all(
-        Object.keys(context.capabilityView.bindings).map((candidate) =>
+        this.#viewAuthority(context.capabilityView).bindings().map(binding => binding.ref).map((candidate) =>
           this.describe(candidate, context),
         ),
       );
@@ -650,7 +727,7 @@ export class ActionRegistry {
     for (const provider of this.#providerBindings.providers()) {
       let descriptors: FabricActionDescriptor[];
       try {
-        descriptors = await provider.list({}, context);
+        descriptors = await runAbortable(context.signal, () => this.#providerBindings.trackProvider(provider, () => provider.list({}, context)));
       } catch {
         continue;
       }
@@ -673,15 +750,18 @@ export class ActionRegistry {
   async acquireScoped(
     ref: string,
     args: Record<string, unknown>,
-    context: FabricInvocationContext,
+    context: FabricInvocationContext & Partial<Pick<FabricRegistryInvocationContext, "authorize" | "approve">>,
+    adopt?: ProviderOperation["adopt"],
   ): Promise<FabricScopedProviderResult> {
+    context = this.#scopeContext(context);
+    args = snapshotArguments(args);
     const { binding, provider, actionName, expectedDescriptorHash } = this.#parseRef(
       ref,
       context.capabilityView,
     );
+    context = this.#bindingContext(binding, context);
     const endInvocation = this.#providerBindings.beginInvocation(binding.id);
     const releaseBinding = this.#providerBindings.retain([binding.id]);
-    let retentionTransferred = false;
     try {
       const resolved = await this.#resolveActionDescriptor(
         provider,
@@ -694,6 +774,7 @@ export class ActionRegistry {
       }
       const action = resolved.action;
       const providerActionName = resolved.repairedFrom === undefined ? actionName : action.name;
+      const authority = { ref: action.ref, descriptor: actionDescriptorHash(action) };
       if (expectedDescriptorHash && actionDescriptorHash(action) !== expectedDescriptorHash) {
         throw new FabricResolutionError(`Fabric capability descriptor changed: ${ref}`);
       }
@@ -703,6 +784,11 @@ export class ActionRegistry {
       if (!provider.acquire) {
         throw new Error(`Fabric provider does not implement scoped acquisition: ${provider.name}`);
       }
+      // Supervised callers may supply the same policy hooks as invoke. Base
+      // contexts remain supported; their host owns authorization/approval.
+      if (context.authorize) {
+        await runAbortable(context.signal, () => context.authorize!(structuredClone(action)));
+      }
       const effectiveSchema = effectiveInputSchema(
         action.ref,
         action.inputSchema,
@@ -710,7 +796,7 @@ export class ActionRegistry {
       const catalogInput = repairCatalogInput(action.ref, effectiveSchema, args);
       const preparedArgs = provider.prepareArguments
         ? await runAbortable(context.signal, () =>
-            provider.prepareArguments!(providerActionName, catalogInput.args, context),
+            this.#providerBindings.trackProvider(provider, () => provider.prepareArguments!(providerActionName, catalogInput.args, context)),
           )
         : catalogInput.args;
       if (typeof preparedArgs !== "object" || preparedArgs === null || Array.isArray(preparedArgs)) {
@@ -719,34 +805,28 @@ export class ActionRegistry {
       const catalog = validateCatalogArgs(
         action.ref,
         effectiveSchema,
-        preparedArgs,
+        // Preparation may return provider-held nested references. Detach before
+        // validation and never expose this validated snapshot to policy hooks.
+        snapshotArguments(preparedArgs),
         catalogInput.observedUnexpected,
       );
       if (catalog.invalid) throw new Error(`Invalid arguments for ${ref}: ${catalog.invalid}`);
+      if (context.approve) {
+        await runAbortable(context.signal, () => context.approve!(structuredClone(action), snapshotArguments(catalog.args)));
+      }
       const acquired = await runAbortable(context.signal, () =>
-        provider.acquire!(providerActionName, catalog.args, context),
-      );
+        this.#runPlanned(binding, providerActionName, authority, "acquire", catalog.args, context, undefined, adopt),
+      ) as FabricScopedProviderResult;
+      throwIfAborted(context.signal);
       if (!acquired || typeof acquired.dispose !== "function") {
         throw new Error(`Scoped acquisition ${ref} did not return a disposer`);
       }
-      let disposal: Promise<void> | undefined;
-      retentionTransferred = true;
-      return {
-        value: acquired.value,
-        dispose: () => {
-          disposal ??= (async () => {
-            try {
-              await acquired.dispose();
-            } finally {
-              await releaseBinding();
-            }
-          })();
-          return disposal;
-        },
-      };
+      return { value: acquired.value, dispose: acquired.dispose };
     } finally {
-      await endInvocation().catch(() => undefined);
-      if (!retentionTransferred) await releaseBinding().catch(() => undefined);
+      void endInvocation().catch(() => undefined);
+      // The interpreter owns the returned resource lease. This temporary hold
+      // protects resolution/acquisition only; cancellation must not await close.
+      void releaseBinding().catch(() => undefined);
     }
   }
 
@@ -755,7 +835,9 @@ export class ActionRegistry {
     args: Record<string, unknown>,
     context: FabricRegistryInvocationContext,
   ): Promise<unknown> {
-    const traceOperation = context.traceOperation ?? context.trace?.issueCall(ref, args);
+    context = this.#scopeContext(context);
+    args = snapshotArguments(args);
+    const traceOperation = context.traceOperation ?? context.trace?.issueCall(ref, snapshotArguments(args));
     let failureStage: "resolve" | "guard" | "prepare" | "validate" | "approve" | "invoke" = "resolve";
     let audit: FabricCallAudit | undefined;
     let invocationActive = false;
@@ -765,6 +847,7 @@ export class ActionRegistry {
         ref,
         context.capabilityView,
       );
+      context = this.#bindingContext(binding, context);
       endBindingInvocation = this.#providerBindings.beginInvocation(binding.id);
       const resolved = await this.#resolveActionDescriptor(
         provider,
@@ -777,6 +860,7 @@ export class ActionRegistry {
       }
       const action = resolved.action;
       const providerActionName = resolved.repairedFrom === undefined ? actionName : action.name;
+      const authority = { ref: action.ref, descriptor: actionDescriptorHash(action) };
       if (expectedDescriptorHash && actionDescriptorHash(action) !== expectedDescriptorHash) {
         throw new FabricResolutionError(`Fabric capability descriptor changed: ${ref}`);
       }
@@ -789,7 +873,7 @@ export class ActionRegistry {
         );
       }
       if (context.authorize) {
-        await runAbortable(context.signal, () => context.authorize!(action));
+        await runAbortable(context.signal, () => context.authorize!(structuredClone(action)));
       }
 
       failureStage = "prepare";
@@ -800,7 +884,7 @@ export class ActionRegistry {
       const catalogInput = repairCatalogInput(action.ref, effectiveSchema, args);
       const preparedArgs = provider.prepareArguments
         ? await runAbortable(context.signal, () =>
-            provider.prepareArguments!(providerActionName, catalogInput.args, context),
+            this.#providerBindings.trackProvider(provider, () => provider.prepareArguments!(providerActionName, catalogInput.args, context)),
           )
         : catalogInput.args;
       if (typeof preparedArgs !== "object" || preparedArgs === null || Array.isArray(preparedArgs)) {
@@ -811,11 +895,13 @@ export class ActionRegistry {
       const catalog = validateCatalogArgs(
         action.ref,
         effectiveSchema,
-        preparedArgs,
+        // Preparation may return provider-held nested references. Detach before
+        // validation and never expose this validated snapshot to policy hooks.
+        snapshotArguments(preparedArgs),
         catalogInput.observedUnexpected,
       );
-      traceOperation?.prepared(catalog.args);
-      if (catalog.normalization) traceOperation?.normalized(catalog.normalization);
+      traceOperation?.prepared(snapshotArguments(catalog.args));
+      if (catalog.normalization) traceOperation?.normalized(structuredClone(catalog.normalization));
       // TypeBox validator messages describe schema expectations only — they
       // never echo argument values — so they are safe for durable traces.
       if (catalog.invalid) {
@@ -877,7 +963,7 @@ export class ActionRegistry {
       }
 
       failureStage = "approve";
-      await runAbortable(context.signal, () => context.approve(action, catalog.args));
+      await runAbortable(context.signal, () => context.approve(structuredClone(action), snapshotArguments(catalog.args)));
 
       failureStage = "invoke";
       const nestedToolCallId = `${NESTED_TOOL_CALL_ID_PREFIX}${randomUUID()}`;
@@ -927,20 +1013,22 @@ export class ActionRegistry {
       this.#activeEffects.set(nestedToolCallId, { ref, effect });
       let servedFromSpeculation = false;
       let providerValue: unknown;
-      if (this.#speculation && effect.kind === "none") {
+      let providerInvoked = false;
+      try {
+      if (this.#speculation && action.risk === "read" && effect.kind === "none") {
         const served = await runAbortable(context.signal, () =>
-          this.#speculation!.tryServe(context.parentToolCallId, ref, catalog.args, binding.id));
+          this.#speculation!.tryServe(context.parentToolCallId, ref, snapshotArguments(catalog.args), JSON.stringify([binding.id, authority.descriptor, context.capabilityView?.id ?? null])));
         if (served.hit) {
+          providerValue = await runAbortable(context.signal, () => this.#runPlanned(binding, providerActionName, authority, "replay", catalog.args, context, served.value));
           servedFromSpeculation = true;
           activeAudit.speculated = true;
-          providerValue = served.value;
           if (served.replay.updatedArgs !== undefined) {
             const replayedPreview = previewArgs(ref, served.replay.updatedArgs);
             activeAudit.args = boundedPreviewValue(
               replayedPreview,
               MAX_AUDIT_VALUE_CHARS,
             ) as Record<string, unknown>;
-            traceOperation?.prepared(served.replay.updatedArgs);
+            traceOperation?.prepared(snapshotArguments(served.replay.updatedArgs));
             context.observeInvocation?.({
               type: "call_args",
               callId: nestedToolCallId,
@@ -954,12 +1042,10 @@ export class ActionRegistry {
           if (served.replay.preview !== undefined) activeAudit.preview = served.replay.preview;
         }
       }
-      let providerInvoked = false;
-      try {
         if (!servedFromSpeculation) {
         providerInvoked = true;
         providerValue = await runAbortable(context.signal, () =>
-          provider.invoke(providerActionName, catalog.args, {
+          this.#runPlanned(binding, providerActionName, authority, "invoke", catalog.args, {
           ...context,
           nestedToolCallId,
           update(message) {
@@ -993,7 +1079,7 @@ export class ActionRegistry {
               updatedPreview,
               MAX_AUDIT_VALUE_CHARS,
             ) as Record<string, unknown>;
-            traceOperation?.prepared(updatedArgs);
+            traceOperation?.prepared(snapshotArguments(updatedArgs));
             context.observeInvocation?.({
               type: "call_args",
               callId: nestedToolCallId,
@@ -1004,17 +1090,19 @@ export class ActionRegistry {
             if (!invocationActive) return;
             activeAudit.preview = preview;
           },
+          }).finally(() => {
+            if (effect.kind !== "none") this.#speculation?.bumpEpoch();
+            this.#activeEffects.delete(nestedToolCallId);
           }),
         );
         }
       } finally {
-        if (providerInvoked && effect.kind !== "none") this.#speculation?.bumpEpoch();
-        this.#activeEffects.delete(nestedToolCallId);
+        if (!providerInvoked) this.#activeEffects.delete(nestedToolCallId);
       }
       const value = this.toolResultProxy
         ? await runAbortable(context.signal, () => this.toolResultProxy!.proxy({
             action,
-            args: catalog.args,
+            args: snapshotArguments(catalog.args),
             toolCallId: nestedToolCallId,
             value: providerValue,
             ...(context.signal ? { signal: context.signal } : {}),
@@ -1044,6 +1132,7 @@ export class ActionRegistry {
       } else {
         traceOperation?.succeed(bounded.value, { resultTruncated: bounded.truncated });
       }
+      throwIfAborted(context.signal);
       return bounded.value;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1063,7 +1152,7 @@ export class ActionRegistry {
     } finally {
       invocationActive = false;
       if (audit) audit.endedAt ??= Date.now();
-      await endBindingInvocation?.().catch(() => undefined);
+      void endBindingInvocation?.().catch(() => undefined);
     }
   }
 
@@ -1095,12 +1184,15 @@ export class ActionRegistry {
   > {
     if (!this.#speculationEligibility) return undefined;
     try {
+      context = this.#scopeContext(context);
+      args = snapshotArguments(args);
       const { binding, provider, actionName, expectedDescriptorHash } = this.#parseRef(
         ref,
         context.capabilityView,
       );
+      context = this.#bindingContext(binding, context);
       const descriptor = await runAbortable(context.signal, () =>
-        provider.describe(actionName, context));
+        this.#providerBindings.trackProvider(provider, () => provider.describe(actionName, context)));
       if (!descriptor) return undefined;
       const action = resolveDescriptor(provider, descriptor);
       if (expectedDescriptorHash && actionDescriptorHash(action) !== expectedDescriptorHash) {
@@ -1109,7 +1201,8 @@ export class ActionRegistry {
       if (isActiveQuarantine(provider.name, actionName, descriptor.inputSchema)) {
         return undefined;
       }
-      if (!this.#speculationEligibility(action)) return undefined;
+      const authority = { ref: action.ref, descriptor: actionDescriptorHash(action) };
+      if (action.risk !== "read" || action.effect?.kind !== "none" || !this.#speculationEligibility(structuredClone(action))) return undefined;
       const effectiveSchema = effectiveInputSchema(
         action.ref,
         action.inputSchema,
@@ -1117,7 +1210,7 @@ export class ActionRegistry {
       const catalogInput = applyActiveArgRepairs(action.ref, args, effectiveSchema);
       const preparedArgs = provider.prepareArguments
         ? await runAbortable(context.signal, () =>
-            provider.prepareArguments!(actionName, catalogInput, context))
+            this.#providerBindings.trackProvider(provider, () => provider.prepareArguments!(action.name, catalogInput, context)))
         : catalogInput;
       if (
         typeof preparedArgs !== "object" ||
@@ -1127,38 +1220,24 @@ export class ActionRegistry {
         return undefined;
       }
       const repairedArgs = normalizeActiveArguments(action.ref, effectiveSchema,
-        applyActiveArgRepairs(action.ref, preparedArgs, effectiveSchema),
+        applyActiveArgRepairs(action.ref, snapshotArguments(preparedArgs), effectiveSchema),
       ).args;
       if (validationMessage(effectiveSchema, repairedArgs)) return undefined;
       const nestedToolCallId = `${NESTED_TOOL_CALL_ID_PREFIX}spec-${randomUUID()}`;
+      const execute = await this.#preparePlanned(binding, action.name, authority, "speculate", repairedArgs, this.#bindingContext(binding, {
+        ...context, nestedToolCallId, update() {}, activity() {},
+        attachMedia(blocks, note) { replay.media = [...(replay.media ?? []), ...blocks]; if (note) replay.mediaNote = note; },
+        updateArguments(updatedArgs) { replay.updatedArgs = updatedArgs; },
+        attachPreview(preview) { replay.preview = preview; },
+      }));
       return {
-        preparedArgs: repairedArgs,
-        bindingToken: binding.id,
-        execute: async (signal) => {
-          const endBindingInvocation = this.#providerBindings.beginInvocation(binding.id);
-          try {
-            return await runAbortable(signal, () =>
-              provider.invoke(actionName, repairedArgs, {
-                ...context,
-                signal,
-                nestedToolCallId,
-                update() {},
-                activity() {},
-                attachMedia(blocks, note) {
-                  replay.media = [...(replay.media ?? []), ...blocks];
-                  if (note) replay.mediaNote = note;
-                },
-                updateArguments(updatedArgs) {
-                  replay.updatedArgs = updatedArgs;
-                },
-                attachPreview(preview) {
-                  replay.preview = preview;
-                },
-              }),
-            );
-          } finally {
-            await endBindingInvocation().catch(() => undefined);
-          }
+        get preparedArgs() { return snapshotArguments(repairedArgs); },
+        bindingToken: JSON.stringify([binding.id, authority.descriptor, context.capabilityView?.id ?? null]),
+        execute: async signal => {
+          const combined = AbortSignal.any([context.signal!, ...(signal ? [signal] : [])]);
+          const actual = execute(combined);
+          void actual.catch(() => undefined);
+          return runAbortable(combined, () => actual);
         },
       };
     } catch {
@@ -1174,21 +1253,41 @@ export class ActionRegistry {
     );
     const finalizers = [...providers].flatMap((provider) =>
       provider.invocationEnded
-        ? [Promise.resolve().then(() => provider.invocationEnded!(parentToolCallId))]
+        ? [this.#providerBindings.trackProvider(provider, () => provider.invocationEnded!(parentToolCallId), true)]
         : [],
     );
     await settleWithin(finalizers, timeoutMs);
   }
 
-  async close(excludedProviderNames: Set<string> = new Set()): Promise<void> {
-    await this.#providerBindings.close(excludedProviderNames);
+  /** Revocation is distinct from rolling withdrawal: pinned old generations may
+   * survive retirement, but revoked bindings admit no further work. */
+  revokeProvider(name: string): void {
+    const binding = this.#providerBindings.current(name);
+    if (binding) this.#providerBindings.revoke(binding.id);
   }
+
+  providerStatus(): Array<{ name: string; generation: number; state: string; inFlight: number; revoked: boolean; error?: string }> {
+    return this.#providerBindings.entries().map(binding => ({ name: binding.name, generation: binding.generation, state: binding.state,
+      inFlight: binding.inFlight, revoked: this.#providerBindings.signal(binding.id).aborted,
+      ...(binding.closeError ? { error: binding.closeError } : {}) }));
+  }
+
+  async close(excludedProviderNames: Set<string> = new Set()): Promise<void> {
+    this.#shutdown.abort(new Error("Fabric registry closed"));
+    try {
+      if (this.#operations) await (await this.#operations).close();
+    } finally {
+      await this.#providerBindings.close(excludedProviderNames);
+    }
+  }
+
 
   async #resolveCapabilities(
     requirements: readonly (string | FabricCapabilityRequirement)[],
     context: FabricInvocationContext,
     retain: boolean,
   ): Promise<FabricCapabilityViewLease> {
+    context = this.#scopeContext(context);
     const normalized = new Map<string, boolean>();
     for (const requirement of requirements) {
       const ref = (typeof requirement === "string" ? requirement : requirement.ref).trim();
@@ -1209,14 +1308,15 @@ export class ActionRegistry {
         left.localeCompare(right),
       )) {
         try {
-          const { binding, provider, actionName } = this.#parseRef(ref);
+          const { binding, provider, actionName, expectedDescriptorHash } = this.#parseRef(ref, context.capabilityView);
           const release = this.#providerBindings.retain([binding.id]);
           temporaryReleases.push(release);
           const descriptor = await runAbortable(context.signal, () =>
-            provider.describe(actionName, context),
+            this.#providerBindings.trackProvider(provider, () => provider.describe(actionName, context)),
           );
           if (!descriptor) throw new FabricResolutionError(`Unknown Fabric action: ${ref}`);
           const action = resolveDescriptor(provider, descriptor);
+          if (expectedDescriptorHash && actionDescriptorHash(action) !== expectedDescriptorHash) throw new FabricResolutionError(`Committed capability drifted: ${ref}`);
           resolved.set(ref, {
             ref,
             provider: provider.name,
@@ -1232,12 +1332,21 @@ export class ActionRegistry {
 
       let view: FabricCommittedCapabilityView | undefined;
       if (missing.length === 0) {
-        const bindings = Object.fromEntries(resolved);
+        // Resolution awaited provider code: recheck the parent immediately
+        // before deriving, even for an empty/optional-only child. Never derive
+        // from the public view's presentation fields.
+        throwIfAborted(context.signal);
         const values = [...resolved.values()];
+        const authority = context.capabilityView
+          ? this.#viewAuthority(context.capabilityView).derive(values)
+          : CapabilityAuthority.issue(values);
+        if (!authority.active) throw new FabricResolutionError("Fabric capability view is unissued, released, or revoked");
+        const bindings = Object.fromEntries(authority.bindings().map(value => [value.ref, value]));
         if (retain) permanentRelease = this.#providerBindings.retain(
           values.map((binding) => binding.providerBindingId),
         );
-        view = {
+        for (const value of Object.values(bindings)) Object.freeze(value);
+        view = Object.freeze({
           id: randomUUID(),
           digest: descriptorHash(values),
           semanticDigest: descriptorHash(
@@ -1247,8 +1356,20 @@ export class ActionRegistry {
               descriptorHash: hash,
             })),
           ),
-          bindings,
+          bindings: Object.freeze(bindings),
+        });
+        const controller = new AbortController();
+        const parent = context.capabilityView ? this.#requireView(context.capabilityView) : undefined;
+        const signal = AbortSignal.any([this.#shutdown.signal, controller.signal, ...(parent ? [parent] : [])]);
+        this.#views.set(view, { controller, signal, authority });
+        const revoked = () => {
+          authority.release();
+          const release = permanentRelease;
+          permanentRelease = undefined;
+          void release?.().catch(() => undefined);
         };
+        signal.addEventListener("abort", revoked, { once: true });
+        if (signal.aborted) revoked();
       }
       return {
         satisfied: missing.length === 0,
@@ -1258,6 +1379,7 @@ export class ActionRegistry {
         release: async () => {
           const release = permanentRelease;
           permanentRelease = undefined;
+          if (view) this.#views.get(view)?.controller.abort(new Error("Fabric capability view released"));
           await release?.();
         },
       };
@@ -1271,7 +1393,7 @@ export class ActionRegistry {
     context: FabricInvocationContext,
   ): Promise<string[]> {
     try {
-      const descriptors = await runAbortable(context.signal, () => provider.list({}, context));
+      const descriptors = await runAbortable(context.signal, () => this.#providerBindings.trackProvider(provider, () => provider.list({}, context)));
       return descriptors.map((descriptor) => descriptor.name);
     } catch {
       return [];
@@ -1289,7 +1411,7 @@ export class ActionRegistry {
     allowRepair: boolean,
   ): Promise<{ action?: ResolvedFabricAction; suggestions: string[]; repairedFrom?: string }> {
     const descriptor = await runAbortable(context.signal, () =>
-      provider.describe(actionName, context),
+      this.#providerBindings.trackProvider(provider, () => provider.describe(actionName, context)),
     );
     // A quarantined ref resolves as unknown: the model-facing catalog never
     // shows it, and a direct call gets the standard not-found message with
@@ -1298,6 +1420,7 @@ export class ActionRegistry {
       return {
         action: resolveDescriptor(provider, descriptor),
         suggestions: [],
+        ...(descriptor.name !== actionName ? { repairedFrom: actionName } : {}),
       };
     }
     if (!allowRepair) return { suggestions: [] };
@@ -1307,7 +1430,7 @@ export class ActionRegistry {
     const catalogName = applyActiveActionName(provider.name, actionName, declared);
     if (catalogName !== actionName) {
       const catalogDescriptor = await runAbortable(context.signal, () =>
-        provider.describe(catalogName, context),
+        this.#providerBindings.trackProvider(provider, () => provider.describe(catalogName, context)),
       );
       if (catalogDescriptor) {
         return {
@@ -1324,7 +1447,7 @@ export class ActionRegistry {
         countError: false,
       });
       const repairedDescriptor = await runAbortable(context.signal, () =>
-        provider.describe(repair.repaired!, context),
+        this.#providerBindings.trackProvider(provider, () => provider.describe(repair.repaired!, context)),
       );
       if (repairedDescriptor) {
         return {
@@ -1351,19 +1474,20 @@ export class ActionRegistry {
     actionName: string;
     expectedDescriptorHash?: string;
   } {
+    if (view) this.#requireView(view);
     const separator = ref.indexOf(".");
     if (separator <= 0 || separator === ref.length - 1) {
       throw new Error(`Fabric action references must use provider.action: ${ref}`);
     }
     const providerName = ref.slice(0, separator);
-    const pinned = view?.bindings[ref];
+    const pinned = view ? this.#viewAuthority(view).resolve(ref) : undefined;
     if (view && !pinned) {
       throw new FabricResolutionError(`Fabric capability is outside the committed view: ${ref}`);
     }
     const binding = pinned
       ? this.#providerBindings.binding(pinned.providerBindingId)
       : this.#providerBindings.current(providerName);
-    if (!binding || binding.name !== providerName) {
+    if (!binding || binding.name !== providerName || (pinned && (pinned.generation !== binding.generation || pinned.provider !== providerName || pinned.ref !== ref))) {
       if (pinned) {
         throw new FabricResolutionError(
           `Fabric capability binding is no longer available: ${ref} (${pinned.providerBindingId})`,
@@ -1380,10 +1504,52 @@ export class ActionRegistry {
     };
   }
 
+  #requireView(view: FabricCommittedCapabilityView): AbortSignal {
+    const owned = this.#views.get(view);
+    if (!owned || owned.signal.aborted || !owned.authority.active) throw new FabricResolutionError("Fabric capability view is unissued, released, or revoked");
+    return owned.signal;
+  }
+
+  #viewAuthority(view: FabricCommittedCapabilityView): CapabilityAuthority {
+    this.#requireView(view);
+    return this.#views.get(view)!.authority;
+  }
+
+  #scopeContext<T extends FabricInvocationContext>(context: T): T {
+    const view = context.capabilityView ? this.#requireView(context.capabilityView) : undefined;
+    throwIfAborted(context.signal);
+    if (this.#shutdown.signal.aborted) throw new FabricResolutionError("Fabric registry is closed");
+    return { ...context, signal: AbortSignal.any([this.#shutdown.signal, ...(context.signal ? [context.signal] : []), ...(view ? [view] : [])]) };
+  }
+
+  #bindingContext<T extends FabricInvocationContext>(binding: FabricProviderBinding, context: T): T {
+    return { ...context, signal: AbortSignal.any([this.#providerBindings.signal(binding.id), ...(context.signal ? [context.signal] : [])]) };
+  }
+
+  async #preparePlanned(binding: FabricProviderBinding, actionName: string, authority: { ref: string; descriptor: string }, mode: ProviderOperation["mode"], args: Record<string, unknown>, context: FabricInvocationContext, replayValue?: unknown, adopt?: ProviderOperation["adopt"]): Promise<(signal?: AbortSignal) => Promise<unknown>> {
+    const payload = snapshotArguments(args);
+    this.#operations ??= import("./provider-operations.js").then(({ ProviderOperations }) => new ProviderOperations(this.#providerBindings));
+    return (await this.#operations).prepare({ binding, action: actionName, ...authority, mode, args: payload, context, replayValue, ...(adopt ? { adopt } : {}),
+      observe: async observedContext => {
+        const descriptor = await binding.provider.describe(actionName, observedContext);
+        if (!descriptor) return { ref: "", descriptor: "" };
+        const action = resolveDescriptor(binding.provider, descriptor);
+        return { ref: action.ref, descriptor: actionDescriptorHash(action) };
+      },
+    });
+  }
+
+  #runPlanned(binding: FabricProviderBinding, actionName: string, authority: { ref: string; descriptor: string }, mode: ProviderOperation["mode"], args: Record<string, unknown>, context: FabricInvocationContext, replayValue?: unknown, adopt?: ProviderOperation["adopt"]): Promise<unknown> {
+    return this.#providerBindings.track(binding.id, async () => {
+      const execute = await this.#preparePlanned(binding, actionName, authority, mode, args, context, replayValue, adopt);
+      return execute();
+    });
+  }
+
   #requireProvider(name: string): FabricProvider {
     const provider = this.#providerBindings.current(name)?.provider;
     if (provider) return provider;
-    const unavailableReason = this.#unavailable.get(name);
+    const unavailableReason = this.#unavailable.get(name) ?? this.#unavailableResolver?.(name);
     if (unavailableReason) {
       throw new FabricResolutionError(
         `Fabric provider "${name}" is unavailable: ${unavailableReason}`,

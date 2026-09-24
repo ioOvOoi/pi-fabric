@@ -31,6 +31,7 @@ export class TypeScriptKernelRuntime implements FabricKernelRuntime {
     // 宿主注入的 guest prelude（扩展生成的辅助代码）。它单独过一遍门禁（错误归它自己、行号只相对它），
     // 同时参与模型代码那次编译（否则模型看不见 prelude 声明的符号）。
     prelude?: string,
+    includeTypeCorrectness = false,
   ) {
     const code = repairFabricGuestCode(source);
     const coreOverrides = fullCodeMode
@@ -41,7 +42,7 @@ export class TypeScriptKernelRuntime implements FabricKernelRuntime {
       dynamic: buildDynamicGuestDeclarations(sources),
       ...(coreOverrides ? { coreOverrides } : {}),
     });
-    const checked = typeCheckFabricCode(code, declarations, prelude);
+    const checked = typeCheckFabricCode(code, declarations, prelude, includeTypeCorrectness);
     const preludeCheck = prelude ? typeCheckGuestPrelude(prelude, declarations) : undefined;
     return { code, checked, ...(preludeCheck ? { preludeCheck } : {}) };
   }

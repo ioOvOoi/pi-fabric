@@ -2,55 +2,24 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import crossSpawn from "cross-spawn";
 import { StringDecoder } from "node:string_decoder";
 import type { ImageContent } from "@earendil-works/pi-ai";
-import type { AgentRunRecord, AgentRunStatus } from "./agents/types.js";
+import type {
+  AgentRunRecord,
+  AgentRunStatus,
+} from "./agents/types.js";
 
-const NODE_SCRIPT_EXTENSIONS = new Set([
-  ".js",
-  ".cjs",
-  ".mjs",
-  ".ts",
-  ".cts",
-  ".mts",
-]);
-
-// 派发子 pi 后，等待其完成启动并接受首条 RPC 的时间上限。
-// 实测 Windows + 完整扩展套件（provider 注册 + 多个 MCP server）的启动约 34s，
-// 原 15s 窗口会在启动期内误杀所有带 model 的派发。
-// 与 Math.min(run timeout) 组合，保证短超时任务的等待不被放大。
-const DEFAULT_MODEL_ADMISSION_TIMEOUT_MS = 90_000;
-
-/**
- * admission 窗口的实际取值：默认 90s，可用 PI_FABRIC_MODEL_ADMISSION_TIMEOUT_MS 覆写（毫秒）。
- *
- * 为什么要留覆写口：90s 是本机实测定的，慢机器（或装了更多扩展/MCP 的环境）启动更久；一旦超过
- * 窗口，所有带 model 的派发都会以「RPC admission timed out」整片失败，而用户手里没有旋钮，只能
- * 等上游改代码。非法值退回默认：NaN 会让 setTimeout 立刻触发、把每次派发都判死，比不生效危险得多。
- */
-export const modelAdmissionTimeoutMs = (
-  env: NodeJS.ProcessEnv = process.env,
-): number => {
-  const raw = env.PI_FABRIC_MODEL_ADMISSION_TIMEOUT_MS;
-  if (raw === undefined || raw.trim() === "")
-    return DEFAULT_MODEL_ADMISSION_TIMEOUT_MS;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed > 0
-    ? Math.floor(parsed)
-    : DEFAULT_MODEL_ADMISSION_TIMEOUT_MS;
-};
+const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
 const spawnCli = (
   command: string,
   args: readonly string[],
   options: SpawnOptions,
-): ChildProcess =>
-  NODE_SCRIPT_EXTENSIONS.has(path.extname(command).toLowerCase())
-    ? crossSpawn(process.execPath, [command, ...args], options)
-    : crossSpawn(command, [...args], options);
+): ChildProcess => NODE_SCRIPT_EXTENSIONS.has(path.extname(command).toLowerCase())
+  ? crossSpawn(process.execPath, [command, ...args], options)
+  : crossSpawn(command, [...args], options);
 
 type ClaudeCliModule = typeof import("./agents/claude-cli.js");
 type VedaCliModule = typeof import("./agents/veda-cli.js");
@@ -58,11 +27,17 @@ type CompactControlModule = typeof import("./agents/compact-control.js");
 type WorkerOptionsModule = typeof import("./worker/options.js");
 type WorkerRunRecordModule = typeof import("./worker/run-record.js");
 type WorkerSessionExportModule = typeof import("./worker/session-export.js");
+type WorkerEventProjectionModule = typeof import("./worker/event-projection.js");
+const loadWorkerEventProjection = async (): Promise<WorkerEventProjectionModule> => {
+  if (!import.meta.url.endsWith(".ts")) return import("./worker/event-projection.js");
+  const sourceModulePath = "./worker/event-projection.ts";
+  return import(sourceModulePath) as Promise<WorkerEventProjectionModule>;
+};
+
 type WorkerModelControlModule = typeof import("./worker/model-control.js");
 
 const loadWorkerModelControl = async (): Promise<WorkerModelControlModule> => {
-  if (!import.meta.url.endsWith(".ts"))
-    return import("./worker/model-control.js");
+  if (!import.meta.url.endsWith(".ts")) return import("./worker/model-control.js");
   const sourceModulePath = "./worker/model-control.ts";
   return import(sourceModulePath) as Promise<WorkerModelControlModule>;
 };
@@ -87,17 +62,14 @@ const loadWorkerRunRecord = async (): Promise<WorkerRunRecordModule> => {
   return import(sourceModulePath) as Promise<WorkerRunRecordModule>;
 };
 
-const loadWorkerSessionExport =
-  async (): Promise<WorkerSessionExportModule> => {
-    if (!import.meta.url.endsWith(".ts"))
-      return import("./worker/session-export.js");
-    const sourceModulePath = "./worker/session-export.ts";
-    return import(sourceModulePath) as Promise<WorkerSessionExportModule>;
-  };
+const loadWorkerSessionExport = async (): Promise<WorkerSessionExportModule> => {
+  if (!import.meta.url.endsWith(".ts")) return import("./worker/session-export.js");
+  const sourceModulePath = "./worker/session-export.ts";
+  return import(sourceModulePath) as Promise<WorkerSessionExportModule>;
+};
 
 const loadCompactControl = async (): Promise<CompactControlModule> => {
-  if (!import.meta.url.endsWith(".ts"))
-    return import("./agents/compact-control.js");
+  if (!import.meta.url.endsWith(".ts")) return import("./agents/compact-control.js");
   const sourceModulePath = "./agents/compact-control.ts";
   return import(sourceModulePath) as Promise<CompactControlModule>;
 };
@@ -142,8 +114,7 @@ const extractText = (message: Record<string, unknown>): string => {
 const readImages = (filePath: string | undefined): ImageContent[] => {
   if (!filePath) return [];
   const parsed: unknown = JSON.parse(fs.readFileSync(filePath, "utf8"));
-  if (!Array.isArray(parsed))
-    throw new Error("Agent images file must contain an array");
+  if (!Array.isArray(parsed)) throw new Error("Agent images file must contain an array");
   const images: ImageContent[] = [];
   for (const value of parsed) {
     if (
@@ -165,43 +136,31 @@ const readImages = (filePath: string | undefined): ImageContent[] => {
   return images;
 };
 
-const numberField = (value: unknown): number =>
-  typeof value === "number" ? value : 0;
+const numberField = (value: unknown): number => (typeof value === "number" ? value : 0);
 
 const stringField = (value: unknown): string | undefined =>
   typeof value === "string" && value.trim() ? value.trim() : undefined;
 
 const assistantError = (message: Record<string, unknown>): string => {
   const details: string[] = [];
-  const direct =
-    stringField(message.errorMessage) ?? stringField(message.error);
+  const direct = stringField(message.errorMessage) ?? stringField(message.error);
   if (direct) details.push(direct);
   if (Array.isArray(message.diagnostics)) {
     for (const diagnostic of message.diagnostics) {
-      if (
-        typeof diagnostic !== "object" ||
-        diagnostic === null ||
-        Array.isArray(diagnostic)
-      )
-        continue;
+      if (typeof diagnostic !== "object" || diagnostic === null || Array.isArray(diagnostic)) continue;
       const record = diagnostic as Record<string, unknown>;
       const nested =
-        typeof record.error === "object" &&
-        record.error !== null &&
-        !Array.isArray(record.error)
+        typeof record.error === "object" && record.error !== null && !Array.isArray(record.error)
           ? (record.error as Record<string, unknown>)
           : undefined;
-      const detail =
-        stringField(nested?.message) ?? stringField(record.message);
+      const detail = stringField(nested?.message) ?? stringField(record.message);
       if (detail) details.push(detail);
     }
   }
   const unique = [...new Set(details)];
   const provider = stringField(message.provider);
   const model = stringField(message.model);
-  const source = [provider, model]
-    .filter((value): value is string => Boolean(value))
-    .join("/");
+  const source = [provider, model].filter((value): value is string => Boolean(value)).join("/");
   const summary = unique.join(" · ") || "Pi agent reported an error";
   return `${source ? `${source}: ` : ""}${summary}`.slice(0, MAX_STDERR_CHARS);
 };
@@ -213,10 +172,10 @@ const terminateChild = (child: ChildProcess, signal: NodeJS.Signals): void => {
   if (!child.pid) return;
   try {
     process.kill(process.platform === "win32" ? child.pid : -child.pid, signal);
-  } catch {
-    /* child process group already exited */
-  }
+  } catch { /* child process group already exited */ }
 };
+
+
 
 let crashContext: { statusFile: string; record: AgentRunRecord } | undefined;
 let runRecordHelpers: WorkerRunRecordModule | undefined;
@@ -224,71 +183,31 @@ let terminalWritten = false;
 const writeCrashStatus = (error: unknown): void => {
   if (!crashContext || !runRecordHelpers || terminalWritten) return;
   try {
-    runRecordHelpers.writeCrashRunRecord(
-      crashContext.statusFile,
-      crashContext.record,
-      error,
-    );
+    runRecordHelpers.writeCrashRunRecord(crashContext.statusFile, crashContext.record, error);
   } catch {
     // Best effort: if the crash-status write itself fails, #monitor falls back
     // to "Agent transport exited without a result".
   }
 };
-/**
- * 本文件既是 worker 的子进程入口，也会被测试直接 import。
- * 只有「真的以入口身份启动」时才装崩溃处理、才跑 main()：否则一次 import
- * 就会给宿主进程挂上 process.exit(1) 的钩子，并把 worker 启动逻辑真跑一遍
- * （vitest 的 fork 池就是这么被打死的："Worker exited unexpectedly"）。
- *
- * 判定刻意保守：拿不到入口路径（argv[1] 为空）或比较过程出错时都当作入口，
- * 宁可多跑一遍，也不能让真的 worker 静默不干活。
- */
-const isWorkerEntry = (): boolean => {
-  const entry = process.argv[1];
-  if (!entry) return true;
-  try {
-    const normalize = (value: string): string => {
-      const absolute = path.resolve(value);
-      return process.platform === "win32" ? absolute.toLowerCase() : absolute;
-    };
-    return normalize(entry) === normalize(fileURLToPath(import.meta.url));
-  } catch {
-    return true;
-  }
-};
-
-const isEntry = isWorkerEntry();
-
-if (isEntry) {
-  process.on("uncaughtException", (error) => {
-    writeCrashStatus(error);
-    process.stderr.write(
-      `${error instanceof Error ? (error.stack ?? error.message) : error}\n`,
-    );
-    process.exit(1);
-  });
-  process.on("unhandledRejection", (error) => {
-    writeCrashStatus(error);
-    process.stderr.write(
-      `Unhandled rejection: ${error instanceof Error ? (error.stack ?? error.message) : error}\n`,
-    );
-    process.exit(1);
-  });
-}
+process.on("uncaughtException", (error) => {
+  writeCrashStatus(error);
+  process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : error}\n`);
+  process.exit(1);
+});
+process.on("unhandledRejection", (error) => {
+  writeCrashStatus(error);
+  process.stderr.write(`Unhandled rejection: ${error instanceof Error ? error.stack ?? error.message : error}\n`);
+  process.exit(1);
+});
 
 const main = async (): Promise<void> => {
-  const [
-    optionHelpers,
-    loadedRunRecordHelpers,
-    sessionExportHelpers,
-    { parseStructuredValue, validateAgentResult },
-    { PiModelControl },
-  ] = await Promise.all([
+  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }] = await Promise.all([
     loadWorkerOptions(),
     loadWorkerRunRecord(),
     loadWorkerSessionExport(),
     loadAgentResult(),
     loadWorkerModelControl(),
+    loadWorkerEventProjection(),
   ]);
   runRecordHelpers = loadedRunRecordHelpers;
   const {
@@ -331,12 +250,7 @@ const main = async (): Promise<void> => {
       fs.mkdirSync(path.dirname(options.lifecycleFile), { recursive: true });
       fs.appendFileSync(
         options.lifecycleFile,
-        JSON.stringify({
-          version: 1,
-          event,
-          occurredAt: Date.now(),
-          ...(data ? { data } : {}),
-        }) + "\n",
+        JSON.stringify({ version: 1, event, occurredAt: Date.now(), ...(data ? { data } : {}) }) + "\n",
         { encoding: "utf8", mode: 0o600 },
       );
     } catch {
@@ -351,10 +265,7 @@ const main = async (): Promise<void> => {
   // stalled mid-run — append synchronously so events are durable immediately.
   const appendLog = (text: string): void => {
     try {
-      fs.appendFileSync(options.logFile, text, {
-        encoding: "utf8",
-        mode: 0o600,
-      });
+      fs.appendFileSync(options.logFile, text, { encoding: "utf8", mode: 0o600 });
     } catch {
       // Event logging is best-effort and must not fail the child run.
     }
@@ -372,23 +283,19 @@ const main = async (): Promise<void> => {
   if (options.sessionFile) piArguments.push("--session", options.sessionFile);
   else piArguments.push("--no-session");
   if (!options.extensions) piArguments.push("--no-extensions");
-  if (options.fabricExtensionPath)
-    piArguments.push("-e", options.fabricExtensionPath);
-  if (options.tools.length > 0)
-    piArguments.push("--tools", options.tools.join(","));
+  if (options.fabricExtensionPath) piArguments.push("-e", options.fabricExtensionPath);
+  if (options.tools.length > 0) piArguments.push("--tools", options.tools.join(","));
   else piArguments.push("--no-tools"); // explicit empty allowlist => no tools, not Pi defaults
   if (options.model) piArguments.push("--model", options.model);
   if (thinking) piArguments.push("--thinking", thinking);
-  if (options.systemPrompt)
-    piArguments.push("--append-system-prompt", options.systemPrompt);
+  if (options.systemPrompt) piArguments.push("--append-system-prompt", options.systemPrompt);
   if (schema) {
     piArguments.push(
       "--append-system-prompt",
       `Your final response must contain only JSON matching this schema, without Markdown fences:\n${schema}`,
     );
   }
-  const claudeCli =
-    options.runner === "claude" ? await loadClaudeCli() : undefined;
+  const claudeCli = options.runner === "claude" ? await loadClaudeCli() : undefined;
   const vedaCli = options.runner === "veda" ? await loadVedaCli() : undefined;
   const childArguments =
     options.runner === "claude"
@@ -398,13 +305,9 @@ const main = async (): Promise<void> => {
           persistentSession: Boolean(options.sessionFile),
           ...(options.model ? { model: options.model } : {}),
           ...(thinking ? { thinking } : {}),
-          ...(options.systemPrompt
-            ? { systemPrompt: options.systemPrompt }
-            : {}),
+          ...(options.systemPrompt ? { systemPrompt: options.systemPrompt } : {}),
           ...(schema ? { schema } : {}),
-          ...(options.runnerSessionId
-            ? { runnerSessionId: options.runnerSessionId }
-            : {}),
+          ...(options.runnerSessionId ? { runnerSessionId: options.runnerSessionId } : {}),
           name: options.name,
         })
       : options.runner === "veda"
@@ -431,15 +334,16 @@ const main = async (): Promise<void> => {
     detached: process.platform !== "win32",
     env: {
       ...process.env,
+      ...(options.inheritedSessionPins && options.inheritedSessionPins.length > 0
+        ? {
+            PI_MULTIPROVIDER_SESSION_PINS: JSON.stringify(options.inheritedSessionPins),
+          }
+        : {}),
       PI_FABRIC_DEPTH: String(options.depth),
       PI_FABRIC_PARENT_RUN: options.id,
       PI_FABRIC_AGENT_NAME: options.name,
-      ...(options.mainAgentId
-        ? { PI_FABRIC_MAIN_AGENT_ID: options.mainAgentId }
-        : {}),
-      ...(options.fabricSessionId
-        ? { PI_FABRIC_SESSION_ID: options.fabricSessionId }
-        : {}),
+      ...(options.mainAgentId ? { PI_FABRIC_MAIN_AGENT_ID: options.mainAgentId } : {}),
+      ...(options.fabricSessionId ? { PI_FABRIC_SESSION_ID: options.fabricSessionId } : {}),
       PI_FABRIC_GRANTED_RISKS: options.grantedRisks.join(","),
       PI_FABRIC_FULL_CODE_MODE: String(options.fullCodeMode),
       // Never leak an ambient native-kernel selector into a non-Fabric runner.
@@ -457,12 +361,8 @@ const main = async (): Promise<void> => {
       ),
       PI_FABRIC_CAPABILITY_DIGEST: options.capabilityDigest ?? "",
       ...(options.meshRoot ? { PI_FABRIC_MESH_ROOT: options.meshRoot } : {}),
-      ...(options.projectRoot
-        ? { PI_FABRIC_PROJECT_ROOT: options.projectRoot }
-        : {}),
-      ...(options.ownerHostId
-        ? { PI_FABRIC_OWNER_HOST_ID: options.ownerHostId }
-        : {}),
+      ...(options.projectRoot ? { PI_FABRIC_PROJECT_ROOT: options.projectRoot } : {}),
+      ...(options.ownerHostId ? { PI_FABRIC_OWNER_HOST_ID: options.ownerHostId } : {}),
       ...(options.ownerIdentityId
         ? { PI_FABRIC_OWNER_IDENTITY_ID: options.ownerIdentityId }
         : {}),
@@ -477,6 +377,7 @@ const main = async (): Promise<void> => {
   // once the child closes instead of treating stdout as NDJSON lines.
   let vedaOutput = "";
   let vedaParsed: Record<string, unknown> | undefined;
+  const eventProjection = options.runner === "pi" ? new PiEventProjection() : undefined;
   const outputDecoder = new StringDecoder("utf8");
   const stderrDecoder = new StringDecoder("utf8");
   let terminalStatus: AgentRunStatus | undefined;
@@ -486,7 +387,8 @@ const main = async (): Promise<void> => {
 
   const update = (): void => updateRunRecord(options.statusFile, record);
 
-  let modelTimer: NodeJS.Timeout | undefined;
+  // Auth checks and model_select hooks can be slow under concurrent launches.
+  // Startup and admission share the overall run timeout below, not a shorter cap.
   const modelControl = new PiModelControl(options.id, options.model, thinking, {
     send(frame) {
       if (terminalStatus) return;
@@ -498,33 +400,21 @@ const main = async (): Promise<void> => {
       update();
     },
     admitted(model, effectiveThinking) {
-      if (modelTimer) clearTimeout(modelTimer);
       if (terminalStatus) return;
       if (model) record.model = model;
-      if (
-        ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(
-          effectiveThinking ?? "",
-        )
-      ) {
-        record.thinking = effectiveThinking as NonNullable<
-          AgentRunRecord["thinking"]
-        >;
+      if (["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(effectiveThinking ?? "")) {
+        record.thinking = effectiveThinking as NonNullable<AgentRunRecord["thinking"]>;
       }
       update();
-      child.stdin?.write(
-        `${JSON.stringify({ type: "prompt", message: task, ...(images.length > 0 ? { images } : {}) })}\n`,
-      );
+      child.stdin?.write(`${JSON.stringify({ type: "prompt", message: task, ...(images.length > 0 ? { images } : {}) })}\n`);
     },
     fail(error) {
       if (terminalStatus) return;
-      if (modelTimer) clearTimeout(modelTimer);
       terminalStatus = "failed";
       terminalError = error;
       record.error = error;
       update();
-      appendLog(
-        `${JSON.stringify({ type: "fabric_model_error", requestedModel: options.model, model: record.model, error })}\n`,
-      );
+      appendLog(`${JSON.stringify({ type: "fabric_model_error", requestedModel: options.model, model: record.model, error })}\n`);
       terminateChild(child, "SIGTERM");
       setTimeout(() => terminateChild(child, "SIGKILL"), KILL_GRACE_MS).unref();
       child.stdin?.end();
@@ -564,10 +454,7 @@ const main = async (): Promise<void> => {
       ...(options.actorId ? { actorId: options.actorId } : {}),
       ...(options.actorName ? { actorName: options.actorName } : {}),
       cumulativeTokens:
-        snapshot.input +
-        snapshot.output +
-        snapshot.cacheRead +
-        snapshot.cacheWrite,
+        snapshot.input + snapshot.output + snapshot.cacheRead + snapshot.cacheWrite,
       input: delta?.input ?? 0,
       output: delta?.output ?? 0,
       cacheRead: delta?.cacheRead ?? 0,
@@ -647,14 +534,12 @@ const main = async (): Promise<void> => {
       input: claudeCompletedUsage.input + claudeCurrentUsage.input,
       output: claudeCompletedUsage.output + claudeCurrentUsage.output,
       cacheRead: claudeCompletedUsage.cacheRead + claudeCurrentUsage.cacheRead,
-      cacheWrite:
-        claudeCompletedUsage.cacheWrite + claudeCurrentUsage.cacheWrite,
+      cacheWrite: claudeCompletedUsage.cacheWrite + claudeCurrentUsage.cacheWrite,
       cost: claudeCompletedUsage.cost,
     };
   };
 
-  const claudeSentInputs: Array<{ kind: ClaudeInputKind; message: string }> =
-    [];
+  const claudeSentInputs: Array<{ kind: ClaudeInputKind; message: string }> = [];
   const claudeSteering: string[] = [];
   const claudeFollowUps: string[] = [];
   let claudeSteeringMode: "all" | "one-at-a-time" = "one-at-a-time";
@@ -662,8 +547,7 @@ const main = async (): Promise<void> => {
   let claudeCanFollowUp = false;
   let claudeResultSeen = false;
   const enqueueClaudeControl = (queue: string[], message: string): void => {
-    const pendingInputs =
-      claudeSentInputs.length + claudeSteering.length + claudeFollowUps.length;
+    const pendingInputs = claudeSentInputs.length + claudeSteering.length + claudeFollowUps.length;
     if (pendingInputs >= MAX_CLAUDE_PENDING_INPUTS) return;
     queue.push(message);
   };
@@ -690,8 +574,7 @@ const main = async (): Promise<void> => {
   ): void => {
     if (claudeCloseTimer) clearTimeout(claudeCloseTimer);
     claudeCloseTimer = undefined;
-    if (!child.stdin || child.stdin.writableEnded || child.stdin.destroyed)
-      return;
+    if (!child.stdin || child.stdin.writableEnded || child.stdin.destroyed) return;
     claudeSentInputs.push({ kind, message });
     if (kind === "follow_up") claudeCanFollowUp = false;
     child.stdin.write(
@@ -702,9 +585,7 @@ const main = async (): Promise<void> => {
 
   const flushClaudeSteering = (): void => {
     if (claudeSteering.length === 0) return;
-    const alreadySent = claudeSentInputs.some(
-      (entry) => entry.kind === "steer",
-    );
+    const alreadySent = claudeSentInputs.some((entry) => entry.kind === "steer");
     if (claudeSteeringMode === "one-at-a-time" && alreadySent) return;
     const count = claudeSteeringMode === "all" ? claudeSteering.length : 1;
     for (const message of claudeSteering.splice(0, count)) {
@@ -715,9 +596,7 @@ const main = async (): Promise<void> => {
   const flushClaudeFollowUps = (): void => {
     if (claudeFollowUps.length === 0 || claudeSteering.length > 0) return;
     if (claudeSentInputs.some((entry) => entry.kind === "steer")) return;
-    const alreadySent = claudeSentInputs.some(
-      (entry) => entry.kind === "follow_up",
-    );
+    const alreadySent = claudeSentInputs.some((entry) => entry.kind === "follow_up");
     if (claudeFollowUpMode === "one-at-a-time" && alreadySent) return;
     const count = claudeFollowUpMode === "all" ? claudeFollowUps.length : 1;
     for (const message of claudeFollowUps.splice(0, count)) {
@@ -751,12 +630,7 @@ const main = async (): Promise<void> => {
     }
     if (event.type === "assistant") {
       const message = event.message;
-      if (
-        typeof message !== "object" ||
-        message === null ||
-        Array.isArray(message)
-      )
-        return;
+      if (typeof message !== "object" || message === null || Array.isArray(message)) return;
       const assistant = message as Record<string, unknown>;
       const text = extractText(assistant);
       if (text) {
@@ -766,12 +640,7 @@ const main = async (): Promise<void> => {
       const content = assistant.content;
       if (Array.isArray(content)) {
         for (const block of content) {
-          if (
-            typeof block !== "object" ||
-            block === null ||
-            Array.isArray(block)
-          )
-            continue;
+          if (typeof block !== "object" || block === null || Array.isArray(block)) continue;
           const part = block as Record<string, unknown>;
           if (part.type !== "tool_use") continue;
           const id = stringField(part.id);
@@ -789,11 +658,7 @@ const main = async (): Promise<void> => {
         }
       }
       const usage = assistant.usage;
-      if (
-        typeof usage === "object" &&
-        usage !== null &&
-        !Array.isArray(usage)
-      ) {
+      if (typeof usage === "object" && usage !== null && !Array.isArray(usage)) {
         const values = usage as Record<string, unknown>;
         const delta = {
           input: numberField(values.input_tokens),
@@ -807,9 +672,7 @@ const main = async (): Promise<void> => {
         claudeCurrentUsage.cacheRead += delta.cacheRead;
         claudeCurrentUsage.cacheWrite += delta.cacheWrite;
         syncClaudeUsage();
-        emitTokenUsage(delta, {
-          model: record.model ?? stringField(event.model),
-        });
+        emitTokenUsage(delta, { model: record.model ?? stringField(event.model) });
       }
       if (typeof event.error === "string") {
         sawAgentError = true;
@@ -821,17 +684,11 @@ const main = async (): Promise<void> => {
     }
     if (event.type === "user") {
       const message = event.message;
-      if (
-        typeof message !== "object" ||
-        message === null ||
-        Array.isArray(message)
-      )
-        return;
+      if (typeof message !== "object" || message === null || Array.isArray(message)) return;
       const content = (message as Record<string, unknown>).content;
       if (!Array.isArray(content)) return;
       for (const block of content) {
-        if (typeof block !== "object" || block === null || Array.isArray(block))
-          continue;
+        if (typeof block !== "object" || block === null || Array.isArray(block)) continue;
         const part = block as Record<string, unknown>;
         if (part.type !== "tool_result") continue;
         const id = stringField(part.tool_use_id);
@@ -845,21 +702,11 @@ const main = async (): Promise<void> => {
     }
     if (event.type === "stream_event") {
       const streamEvent = event.event;
-      if (
-        typeof streamEvent !== "object" ||
-        streamEvent === null ||
-        Array.isArray(streamEvent)
-      )
-        return;
+      if (typeof streamEvent !== "object" || streamEvent === null || Array.isArray(streamEvent)) return;
       const stream = streamEvent as Record<string, unknown>;
       if (stream.type !== "content_block_start") return;
       const contentBlock = stream.content_block;
-      if (
-        typeof contentBlock !== "object" ||
-        contentBlock === null ||
-        Array.isArray(contentBlock)
-      )
-        return;
+      if (typeof contentBlock !== "object" || contentBlock === null || Array.isArray(contentBlock)) return;
       const block = contentBlock as Record<string, unknown>;
       const name = stringField(block.name);
       if (block.type === "tool_use" && name) {
@@ -874,13 +721,10 @@ const main = async (): Promise<void> => {
     if (sessionId) record.runnerSessionId = sessionId;
     const resultText = typeof event.result === "string" ? event.result : "";
     if (resultText) record.text = latestRunText(resultText);
-    if (event.structured_output !== undefined)
-      record.value = event.structured_output;
+    if (event.structured_output !== undefined) record.value = event.structured_output;
     record.turns += Math.max(0, Math.floor(numberField(event.num_turns)));
     const resultUsage =
-      typeof event.usage === "object" &&
-      event.usage !== null &&
-      !Array.isArray(event.usage)
+      typeof event.usage === "object" && event.usage !== null && !Array.isArray(event.usage)
         ? (event.usage as Record<string, unknown>)
         : undefined;
     // The result frame supersedes the assistant-frame stream for this turn:
@@ -888,25 +732,15 @@ const main = async (): Promise<void> => {
     // attribution stays exact without double-counting assistant emissions.
     const resultDelta = resultUsage
       ? {
-          input:
-            numberField(resultUsage.input_tokens) - claudeCurrentUsage.input,
-          output:
-            numberField(resultUsage.output_tokens) - claudeCurrentUsage.output,
+          input: numberField(resultUsage.input_tokens) - claudeCurrentUsage.input,
+          output: numberField(resultUsage.output_tokens) - claudeCurrentUsage.output,
           cacheRead:
-            numberField(resultUsage.cache_read_input_tokens) -
-            claudeCurrentUsage.cacheRead,
+            numberField(resultUsage.cache_read_input_tokens) - claudeCurrentUsage.cacheRead,
           cacheWrite:
-            numberField(resultUsage.cache_creation_input_tokens) -
-            claudeCurrentUsage.cacheWrite,
+            numberField(resultUsage.cache_creation_input_tokens) - claudeCurrentUsage.cacheWrite,
           cost: Math.max(0, numberField(event.total_cost_usd)),
         }
-      : {
-          input: 0,
-          output: 0,
-          cacheRead: 0,
-          cacheWrite: 0,
-          cost: Math.max(0, numberField(event.total_cost_usd)),
-        };
+      : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: Math.max(0, numberField(event.total_cost_usd)) };
     claudeCompletedUsage.input += resultUsage
       ? numberField(resultUsage.input_tokens)
       : claudeCurrentUsage.input;
@@ -925,22 +759,15 @@ const main = async (): Promise<void> => {
     claudeCurrentUsage.cacheRead = 0;
     claudeCurrentUsage.cacheWrite = 0;
     syncClaudeUsage();
-    emitTokenUsage(resultDelta, {
-      model: record.model ?? stringField(event.model),
-    });
+    emitTokenUsage(resultDelta, { model: record.model ?? stringField(event.model) });
     enforceTokenLimit();
     const failed = event.is_error === true || event.subtype !== "success";
     if (failed) {
       sawAgentError = true;
       const errors = Array.isArray(event.errors)
-        ? event.errors
-            .filter((value): value is string => typeof value === "string")
-            .join(" · ")
+        ? event.errors.filter((value): value is string => typeof value === "string").join(" · ")
         : "";
-      terminalError =
-        errors ||
-        resultText ||
-        `Claude returned ${String(event.subtype ?? "an error")}`;
+      terminalError = errors || resultText || `Claude returned ${String(event.subtype ?? "an error")}`;
       claudeSteering.splice(0);
       claudeFollowUps.splice(0);
     } else {
@@ -970,20 +797,14 @@ const main = async (): Promise<void> => {
   };
 
   const processEvent = (line: string): void => {
-    if (process.env.PI_FABRIC_INJECT_CRASH === "stream")
-      throw new Error("simulated stream crash");
+    if (process.env.PI_FABRIC_INJECT_CRASH === "stream") throw new Error("simulated stream crash");
     if (!line.trim()) return;
     appendLog(`${line}\n`);
     sessionStream?.write(`${line}\n`);
     let event: Record<string, unknown>;
     try {
       const parsed: unknown = JSON.parse(line);
-      if (
-        typeof parsed !== "object" ||
-        parsed === null ||
-        Array.isArray(parsed)
-      )
-        return;
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return;
       event = parsed as Record<string, unknown>;
     } catch {
       return;
@@ -996,11 +817,7 @@ const main = async (): Promise<void> => {
     if (modelControl.observe(event)) return;
     if (event.type === "message_start" || event.type === "message_update") {
       const message = event.message;
-      if (
-        typeof message === "object" &&
-        message !== null &&
-        !Array.isArray(message)
-      ) {
+      if (typeof message === "object" && message !== null && !Array.isArray(message)) {
         modelControl.observeAssistant(message as Record<string, unknown>);
       }
     }
@@ -1011,17 +828,9 @@ const main = async (): Promise<void> => {
       if (!terminalStatus) terminalError = undefined;
       return;
     }
-    if (
-      event.type === "response" &&
-      event.command === "prompt" &&
-      event.success === false
-    ) {
+    if (event.type === "response" && event.command === "prompt" && event.success === false) {
       sawAgentError = true;
-      if (!terminalStatus)
-        terminalError =
-          typeof event.error === "string"
-            ? event.error
-            : "Pi rejected the prompt";
+      if (!terminalStatus) terminalError = typeof event.error === "string" ? event.error : "Pi rejected the prompt";
       child.stdin?.end();
       return;
     }
@@ -1029,10 +838,7 @@ const main = async (): Promise<void> => {
       const method = event.method;
       if (
         typeof event.id === "string" &&
-        (method === "select" ||
-          method === "confirm" ||
-          method === "input" ||
-          method === "editor")
+        (method === "select" || method === "confirm" || method === "input" || method === "editor")
       ) {
         child.stdin?.write(
           `${JSON.stringify({ type: "extension_ui_response", id: event.id, cancelled: true })}\n`,
@@ -1052,12 +858,8 @@ const main = async (): Promise<void> => {
     if (event.type === "tool_execution_end") {
       if (event.isError === true) {
         emitLifecycle("pi.tool_error", {
-          ...(typeof event.toolCallId === "string"
-            ? { toolCallId: event.toolCallId }
-            : {}),
-          ...(typeof event.toolName === "string"
-            ? { toolName: event.toolName }
-            : {}),
+          ...(typeof event.toolCallId === "string" ? { toolCallId: event.toolCallId } : {}),
+          ...(typeof event.toolName === "string" ? { toolName: event.toolName } : {}),
         });
       }
       delete record.currentTool;
@@ -1066,9 +868,7 @@ const main = async (): Promise<void> => {
     }
     if (event.type === "turn_end") {
       emitLifecycle("pi.turn_end", {
-        ...(typeof event.turnIndex === "number"
-          ? { turnIndex: event.turnIndex }
-          : {}),
+        ...(typeof event.turnIndex === "number" ? { turnIndex: event.turnIndex } : {}),
       });
       record.turns++;
       update();
@@ -1076,14 +876,10 @@ const main = async (): Promise<void> => {
     }
     if (event.type === "queue_update") {
       const steering = Array.isArray(event.steering)
-        ? event.steering.filter(
-            (value): value is string => typeof value === "string",
-          )
+        ? event.steering.filter((value): value is string => typeof value === "string")
         : [];
       const followUp = Array.isArray(event.followUp)
-        ? event.followUp.filter(
-            (value): value is string => typeof value === "string",
-          )
+        ? event.followUp.filter((value): value is string => typeof value === "string")
         : [];
       record.pendingMessages = { steering, followUp };
       update();
@@ -1091,12 +887,7 @@ const main = async (): Promise<void> => {
     }
     if (event.type === "message_end") {
       const message = event.message;
-      if (
-        typeof message !== "object" ||
-        message === null ||
-        Array.isArray(message)
-      )
-        return;
+      if (typeof message !== "object" || message === null || Array.isArray(message)) return;
       const messageRecord = message as Record<string, unknown>;
       if (messageRecord.role !== "assistant") return;
       const text = extractText(messageRecord);
@@ -1144,15 +935,12 @@ const main = async (): Promise<void> => {
     if (event.type === "compaction_end") {
       emitLifecycle("pi.session_compact", {
         ...(typeof event.reason === "string" ? { reason: event.reason } : {}),
-        ...(typeof event.willRetry === "boolean"
-          ? { willRetry: event.willRetry }
-          : {}),
+        ...(typeof event.willRetry === "boolean" ? { willRetry: event.willRetry } : {}),
       });
       return;
     }
     if (event.type === "extension_error") {
-      const error =
-        typeof event.error === "string" ? event.error : "Extension error";
+      const error = typeof event.error === "string" ? event.error : "Extension error";
       stderr = `${stderr}\n${error}`.trim().slice(-MAX_STDERR_CHARS);
       update();
     }
@@ -1167,9 +955,7 @@ const main = async (): Promise<void> => {
     // instructions reach the backend model.
     const sections: string[] = [];
     if (options.systemPrompt) {
-      sections.push(
-        `<system_instructions>\n${options.systemPrompt}\n</system_instructions>`,
-      );
+      sections.push(`<system_instructions>\n${options.systemPrompt}\n</system_instructions>`);
     }
     if (schema) {
       sections.push(
@@ -1180,13 +966,6 @@ const main = async (): Promise<void> => {
     child.stdin?.write(sections.join("\n\n"));
     child.stdin?.end();
   } else {
-    if (options.model) {
-      modelTimer = setTimeout(
-        () => modelControl.fail("RPC admission timed out; task was not sent"),
-        Math.min(modelAdmissionTimeoutMs(), options.timeoutMs),
-      );
-      modelTimer.unref();
-    }
     modelControl.start();
   }
 
@@ -1201,12 +980,7 @@ const main = async (): Promise<void> => {
   let steerRemainder = Buffer.alloc(0);
   let skippingOversizedSteerLine = false;
   const pollSteer = (): void => {
-    if (
-      !options.steerFile ||
-      terminalStatus ||
-      (options.runner === "pi" && !modelControl.ready)
-    )
-      return;
+    if (!options.steerFile || terminalStatus || (options.runner === "pi" && !modelControl.ready)) return;
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(options.steerFile, "r");
@@ -1225,10 +999,7 @@ const main = async (): Promise<void> => {
       const buffer = Buffer.allocUnsafe(length);
       const bytesRead = fs.readSync(descriptor, buffer, 0, length, steerOffset);
       steerOffset += bytesRead;
-      let combined = Buffer.concat([
-        steerRemainder,
-        buffer.subarray(0, bytesRead),
-      ]);
+      let combined = Buffer.concat([steerRemainder, buffer.subarray(0, bytesRead)]);
       if (skippingOversizedSteerLine) {
         const skippedLineEnd = combined.indexOf(0x0a);
         if (skippedLineEnd < 0) return;
@@ -1253,21 +1024,13 @@ const main = async (): Promise<void> => {
         steerRemainder = Buffer.from(remainder);
       }
       let processedCommands = 0;
-      for (const raw of combined
-        .subarray(0, newline + 1)
-        .toString("utf8")
-        .split("\n")) {
+      for (const raw of combined.subarray(0, newline + 1).toString("utf8").split("\n")) {
         if (processedCommands >= MAX_STEER_COMMANDS_PER_POLL) break;
         if (Buffer.byteLength(raw, "utf8") > MAX_STEER_LINE_BYTES) continue;
         const line = raw.trim();
         if (!line) continue;
         processedCommands += 1;
-        let command: {
-          type?: string;
-          message?: string;
-          mode?: string;
-          instructions?: string;
-        };
+        let command: { type?: string; message?: string; mode?: string; instructions?: string };
         try {
           command = JSON.parse(line);
         } catch {
@@ -1277,19 +1040,12 @@ const main = async (): Promise<void> => {
           if (options.runner === "claude") {
             if (claudeCloseTimer) clearTimeout(claudeCloseTimer);
             claudeCloseTimer = undefined;
-            if (
-              command.type === "steer" &&
-              typeof command.message === "string"
-            ) {
+            if (command.type === "steer" && typeof command.message === "string") {
               enqueueClaudeControl(claudeSteering, command.message);
               flushClaudeSteering();
-            } else if (
-              command.type === "follow_up" &&
-              typeof command.message === "string"
-            ) {
+            } else if (command.type === "follow_up" && typeof command.message === "string") {
               enqueueClaudeControl(claudeFollowUps, command.message);
-              if (claudeCanFollowUp && claudeSentInputs.length === 0)
-                flushClaudeFollowUps();
+              if (claudeCanFollowUp && claudeSentInputs.length === 0) flushClaudeFollowUps();
             } else if (
               command.type === "set_steering_mode" &&
               (command.mode === "all" || command.mode === "one-at-a-time")
@@ -1301,50 +1057,21 @@ const main = async (): Promise<void> => {
               (command.mode === "all" || command.mode === "one-at-a-time")
             ) {
               claudeFollowUpMode = command.mode;
-              if (claudeCanFollowUp && claudeSentInputs.length === 0)
-                flushClaudeFollowUps();
+              if (claudeCanFollowUp && claudeSentInputs.length === 0) flushClaudeFollowUps();
             }
             updateClaudeQueue();
           } else if (options.runner === "veda") {
             // Steering is unsupported for the veda runner: Veda executes one
             // headless prompt per invocation. The command is dropped, never
             // forwarded to pi-style stdin frames.
-          } else if (
-            command.type === "steer" &&
-            typeof command.message === "string"
-          ) {
-            child.stdin?.write(
-              JSON.stringify({ type: "steer", message: command.message }) +
-                "\n",
-            );
-          } else if (
-            command.type === "follow_up" &&
-            typeof command.message === "string"
-          ) {
-            child.stdin?.write(
-              JSON.stringify({ type: "follow_up", message: command.message }) +
-                "\n",
-            );
-          } else if (
-            command.type === "set_steering_mode" &&
-            typeof command.mode === "string"
-          ) {
-            child.stdin?.write(
-              JSON.stringify({
-                type: "set_steering_mode",
-                mode: command.mode,
-              }) + "\n",
-            );
-          } else if (
-            command.type === "set_follow_up_mode" &&
-            typeof command.mode === "string"
-          ) {
-            child.stdin?.write(
-              JSON.stringify({
-                type: "set_follow_up_mode",
-                mode: command.mode,
-              }) + "\n",
-            );
+          } else if (command.type === "steer" && typeof command.message === "string") {
+            child.stdin?.write(JSON.stringify({ type: "steer", message: command.message }) + "\n");
+          } else if (command.type === "follow_up" && typeof command.message === "string") {
+            child.stdin?.write(JSON.stringify({ type: "follow_up", message: command.message }) + "\n");
+          } else if (command.type === "set_steering_mode" && typeof command.mode === "string") {
+            child.stdin?.write(JSON.stringify({ type: "set_steering_mode", mode: command.mode }) + "\n");
+          } else if (command.type === "set_follow_up_mode" && typeof command.mode === "string") {
+            child.stdin?.write(JSON.stringify({ type: "set_follow_up_mode", mode: command.mode }) + "\n");
           } else if (command.type === "compact") {
             compactControl.queue(command.instructions);
           }
@@ -1356,19 +1083,14 @@ const main = async (): Promise<void> => {
       fs.closeSync(descriptor);
     }
   };
-  const steerTimer = options.steerFile
-    ? setInterval(pollSteer, 200)
-    : undefined;
+  const steerTimer = options.steerFile ? setInterval(pollSteer, 200) : undefined;
   steerTimer?.unref?.();
 
   const failOversizedEvent = (line: string): void => {
     const prefix = line.slice(0, MAX_EVENT_LINE_CHARS);
     let artifactPath: string | undefined;
     try {
-      artifactPath = path.join(
-        path.dirname(options.logFile),
-        "oversized-event-prefix.txt",
-      );
+      artifactPath = path.join(path.dirname(options.logFile), "oversized-event-prefix.txt");
       fs.writeFileSync(artifactPath, prefix, { encoding: "utf8", mode: 0o600 });
     } catch {
       artifactPath = undefined;
@@ -1387,16 +1109,19 @@ const main = async (): Promise<void> => {
       vedaOutput += decoded;
       return;
     }
-    outputBuffer += decoded;
+    outputBuffer += eventProjection ? eventProjection.write(decoded) : decoded;
     while (true) {
       const newline = outputBuffer.indexOf("\n");
       if (newline < 0) {
-        if (outputBuffer.length > MAX_EVENT_LINE_CHARS) {
-          failOversizedEvent(outputBuffer);
-        }
+        // Redundant Pi lifecycle history has already been elided while streaming.
+        // Keep the cap on authoritative messages and all other event fields;
+        // broad base64/text redaction must not bypass this safety boundary.
+        if (outputBuffer.length > MAX_EVENT_LINE_CHARS) failOversizedEvent(outputBuffer);
         break;
       }
       if (newline > MAX_EVENT_LINE_CHARS) {
+        // The retained record still exceeds the cap. Preserve bounded evidence;
+        // do not use broad text redaction to keep an anomalous run alive.
         failOversizedEvent(outputBuffer.slice(0, newline));
         return;
       }
@@ -1420,6 +1145,9 @@ const main = async (): Promise<void> => {
     if (terminalStatus) return;
     terminalStatus = "timed_out";
     terminalError = `Agent timed out after ${options.timeoutMs}ms`;
+    if (options.runner === "pi" && !modelControl.ready) {
+      terminalError += "; Pi model admission did not complete; task was not sent";
+    }
     terminateChild(child, "SIGTERM");
     setTimeout(() => terminateChild(child, "SIGKILL"), KILL_GRACE_MS).unref();
   }, options.timeoutMs);
@@ -1448,17 +1176,16 @@ const main = async (): Promise<void> => {
   if (steerTimer) clearInterval(steerTimer);
   if (claudeCloseTimer) clearTimeout(claudeCloseTimer);
   clearTimeout(timeout);
-  if (modelTimer) clearTimeout(modelTimer);
   if (options.runner === "pi" && !modelControl.ready && !terminalStatus) {
     terminalStatus = "failed";
     terminalError = `Child Pi exited before requested model admission completed; task was not sent${stderr.trim() ? `: ${stderr.trim()}` : ""}`;
   }
-  if (process.env.PI_FABRIC_INJECT_CRASH === "close")
-    throw new Error("simulated close crash");
+  if (process.env.PI_FABRIC_INJECT_CRASH === "close") throw new Error("simulated close crash");
   if (options.runner === "veda") {
     vedaOutput += outputDecoder.end();
   } else {
-    outputBuffer += outputDecoder.end();
+    const tail = outputDecoder.end();
+    outputBuffer += eventProjection ? eventProjection.write(tail) + eventProjection.end() : tail;
   }
   recordStderr(stderrDecoder.end());
   if (options.runner === "veda") {
@@ -1466,11 +1193,7 @@ const main = async (): Promise<void> => {
     if (trimmed) {
       try {
         const parsed = parseStructuredValue(trimmed);
-        if (
-          typeof parsed === "object" &&
-          parsed !== null &&
-          !Array.isArray(parsed)
-        ) {
+        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
           vedaParsed = parsed as Record<string, unknown>;
           const text = stringField(vedaParsed.text) ?? "";
           if (text) {
@@ -1480,22 +1203,14 @@ const main = async (): Promise<void> => {
           const sessionId = stringField(vedaParsed.sessionId);
           if (sessionId) record.runnerSessionId = sessionId;
           const usage = vedaParsed.usage;
-          if (
-            typeof usage === "object" &&
-            usage !== null &&
-            !Array.isArray(usage)
-          ) {
+          if (typeof usage === "object" && usage !== null && !Array.isArray(usage)) {
             const values = usage as Record<string, unknown>;
             const input = numberField(values.inputTokens);
             const output = numberField(values.outputTokens);
             const cacheRead = numberField(values.cachedTokens);
-            const cost =
-              typeof values.costUsd === "number" ? values.costUsd : 0;
+            const cost = typeof values.costUsd === "number" ? values.costUsd : 0;
             record.usage = { input, output, cacheRead, cacheWrite: 0, cost };
-            emitTokenUsage(
-              { input, output, cacheRead, cacheWrite: 0, cost },
-              { model: stringField(vedaParsed.model) },
-            );
+            emitTokenUsage({ input, output, cacheRead, cacheWrite: 0, cost }, { model: stringField(vedaParsed.model) });
           }
           const envelopeErrors: string[] = [];
           const error = stringField(vedaParsed.error);
@@ -1505,24 +1220,15 @@ const main = async (): Promise<void> => {
           // report failure only via design/worker fields, not envelope.error.
           for (const key of ["design", "worker"] as const) {
             const gate = vedaParsed[key];
-            if (
-              typeof gate !== "object" ||
-              gate === null ||
-              Array.isArray(gate)
-            )
-              continue;
+            if (typeof gate !== "object" || gate === null || Array.isArray(gate)) continue;
             const status = gate as Record<string, unknown>;
             if (status.ok !== false) continue;
             const details = Array.isArray(status.errors)
-              ? status.errors
-                  .filter((entry): entry is string => typeof entry === "string")
-                  .join("; ")
+              ? status.errors.filter((entry): entry is string => typeof entry === "string").join("; ")
               : [stringField(status.reason), stringField(status.detail)]
                   .filter((entry): entry is string => entry !== undefined)
                   .join(": ");
-            envelopeErrors.push(
-              `Veda ${key} failed${details ? `: ${details}` : ""}`,
-            );
+            envelopeErrors.push(`Veda ${key} failed${details ? `: ${details}` : ""}`);
           }
           if (envelopeErrors.length > 0) {
             sawAgentError = true;
@@ -1544,8 +1250,7 @@ const main = async (): Promise<void> => {
     record.compaction?.status === "queued" ||
     record.compaction?.status === "in_flight"
   ) {
-    const error =
-      terminalError ?? "Child Pi exited before the queued compaction completed";
+    const error = terminalError ?? "Child Pi exited before the queued compaction completed";
     record.compaction = {
       ...record.compaction,
       status: "failed",
@@ -1581,9 +1286,10 @@ const main = async (): Promise<void> => {
   }
   if (record.status === "completed" && options.schemaFile) {
     try {
-      const schema = JSON.parse(
-        fs.readFileSync(options.schemaFile, "utf8"),
-      ) as Record<string, unknown>;
+      const schema = JSON.parse(fs.readFileSync(options.schemaFile, "utf8")) as Record<
+        string,
+        unknown
+      >;
       validateAgentResult(record, schema);
     } catch (error) {
       record.status = "failed";
@@ -1603,12 +1309,8 @@ const main = async (): Promise<void> => {
   process.exitCode = record.status === "completed" ? 0 : 1;
 };
 
-if (isEntry) {
-  main().catch((error) => {
-    console.error(
-      error instanceof Error ? (error.stack ?? error.message) : String(error),
-    );
-    writeCrashStatus(error);
-    process.exit(1);
-  });
-}
+main().catch((error) => {
+  console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
+  writeCrashStatus(error);
+  process.exit(1);
+});

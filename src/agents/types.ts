@@ -8,6 +8,7 @@ import type { FabricKernel } from "../runtime/kernel.js";
 import type { ThinkingTransferInput } from "./thinking-transfer.js";
 import type { FabricThinking } from "../thinking.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
+import type { InheritedSessionPin } from "./session-pins.js";
 
 export type AgentRunStatus =
   | "queued"
@@ -76,6 +77,8 @@ export interface AgentRunRequest {
   thinkingTransfer?: ThinkingTransferInput | undefined;
   /** Compact the inherited trajectory with Fabric's deterministic compactor before the executor resumes. */
   handoffCompact?: HandoffCompactionRequest;
+  /** Host-only parent /switch-account pins; not a model argument. */
+  inheritedSessionPins?: InheritedSessionPin[];
 }
 
 export interface AgentUsage {
@@ -226,6 +229,20 @@ export interface AgentWorkerOptions {
   attachCommand?: string;
   branch?: string;
   worktree?: string;
+  inheritedSessionPins?: InheritedSessionPin[];
+  carryOver?: AgentRunCarryOver;
+}
+
+/**
+ * Cumulative totals a relaunched worker seeds its fresh run record with. The
+ * worker owns the run record, so passing the prefix here (instead of adding it
+ * host-side) keeps every reader — status file, live UI rows, settled result,
+ * and the budget ledger's settle residual — on one cumulative number.
+ */
+export interface AgentRunCarryOver {
+  turns: number;
+  toolCalls: number;
+  usage: AgentUsage;
 }
 
 export interface AgentTransportLaunch {

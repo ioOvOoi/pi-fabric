@@ -119,6 +119,9 @@ export const formatTokens = (value: number): string =>
 export const formatToolCount = (count: number): string =>
   `${count} ${count === 1 ? "tool" : "tools"}`;
 
+export const formatBlockedCount = (count: number): string =>
+  `${count} blocked`;
+
 // The threshold row is a mode selection: Pi default, a window-occupancy
 // percent, or an exact token count. mode: "default" clears both maps so Pi's
 // built-in threshold applies.
@@ -257,16 +260,19 @@ export const summaryFor = (id: string, config: FabricConfig): string => {
       const kernel = config.executor.kernel === "python"
         ? `python · ${config.executor.pythonRuntime === "monty" ? "monty" : config.executor.cpython.binary}`
         : `typescript · ${config.executor.runtime}`;
-      return `${kernel} · ${formatMs(config.executor.timeoutMs)} · max ${formatMs(config.executor.maxTimeoutMs)}${refFloors > 0 ? ` · ${refFloors} ref floor${refFloors === 1 ? "" : "s"}` : ""}`;
+      const hang = config.executor.shellHangMs === 0 ? "hang off" : `hang ${formatMs(config.executor.shellHangMs)}`;
+      return `${kernel} · ${formatMs(config.executor.timeoutMs)} · max ${formatMs(config.executor.maxTimeoutMs)} · ${hang}${refFloors > 0 ? ` · ${refFloors} ref floor${refFloors === 1 ? "" : "s"}` : ""}`;
     }
     case "schema":
       return config.schema.mode;
     case "approvals":
       return config.approvals.execute;
     case "mcp":
-      return config.mcp.enabled ? "enabled" : "disabled";
+      return config.mcp.enabled
+        ? config.mcp.jev.semanticSearch ? "enabled · semantic" : "enabled"
+        : "disabled";
     case "prewalk":
-      return `${config.prewalk.enabled === false ? "off · " : ""}${config.prewalk.mode} · ${config.prewalk.model || PREWALK_MODEL_UNSET_LABEL}${config.prewalk.thinking ? ` · ${thinkingLabel(config.prewalk.thinking)}` : ""}${config.prewalk.alwaysRearm ? " · repeat" : ""}`;
+      return `${config.prewalk.enabled === false ? "off · " : ""}${config.prewalk.mode} · ${config.prewalk.model || PREWALK_MODEL_UNSET_LABEL}${config.prewalk.thinking ? ` · ${thinkingLabel(config.prewalk.thinking)}` : ""}${config.prewalk.requirePlan ? " · plan" : ""}${config.prewalk.alwaysRearm ? " · repeat" : ""}`;
     case "agents":
       return `${config.agents.runner}/${config.agents.transport}`;
     case "capture":

@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 import { build } from "esbuild";
+import { copyFileSync, mkdirSync, readFileSync } from "node:fs";
 
 const primaryEntryPoints = [
   "src/index.ts",
   "src/memory.ts",
   "src/mcp.ts",
   "src/agents.ts",
+  "src/jev.ts",
   "src/protocol.ts",
   "src/worker.ts",
   "src/residency/host.ts",
@@ -19,6 +21,8 @@ const primaryEntryPoints = [
   "src/memory/search.ts",
   "src/memory/discovery.ts",
   "src/memory/normalize.ts",
+  "src/memory/file-worker.ts",
+  "src/memory/worker-provider.ts",
   "src/providers/memory-provider.ts",
 ];
 
@@ -26,11 +30,16 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  "src/core/provider-operations.ts",
   "src/agents/claude-cli.ts",
   "src/agents/compact-control.ts",
   "src/agents/result.ts",
   "src/agents/veda-cli.ts",
   "src/fabric-runtime-state.ts",
+  "src/components/configuration.ts",
+  "src/providers/jev-provider.ts",
+  "src/jev/client.ts",
+  "src/jev/observation.ts",
   "src/runtime/core-override-guest-types.ts",
   "src/runtime/dynamic-guest-types.ts",
   "src/runtime/guest-types.ts",
@@ -50,6 +59,7 @@ const lazyEntryPoints = [
   "src/ui/conversation-native-reader.ts",
   "src/ui/model-picker.ts",
   "src/ui/settings.ts",
+  "src/worker/event-projection.ts",
   "src/worker/model-control.ts",
   "src/worker/options.ts",
   "src/worker/run-record.ts",
@@ -72,6 +82,18 @@ const result = await build({
   metafile: true,
   logLevel: "info",
 });
+
+// tsc does not copy input .d.ts files; ship the generated kernel ABI and receipt.
+mkdirSync("dist/verified/generated", { recursive: true });
+const receiptPath = "src/verified/generated/manifest.json";
+const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+for (const source of Object.keys(receipt.outputs)) {
+  if (!/^src\/verified\/generated\/[a-z-]+\.(?:js|d\.ts)$/.test(source)) {
+    throw new Error(`Unexpected verified artifact path: ${source}`);
+  }
+  copyFileSync(source, source.replace(/^src\//, "dist/"));
+}
+copyFileSync(receiptPath, "dist/verified/generated/manifest.json");
 
 const bundledPackages = Object.keys(result.metafile.inputs).filter((input) =>
   input.includes("node_modules/"),

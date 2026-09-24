@@ -44,6 +44,7 @@ import type {
 } from "./protocol.js";
 import type { FabricRuntimeState } from "./fabric-runtime-state.js";
 import type { FabricRuntimePaths } from "./runtime-paths.js";
+import type { FabricLoadedFileIdentity } from "./build-identity.js";
 
 import { FabricManagedHost, type FabricManagedHostOptions } from "./managed-host.js";
 
@@ -51,6 +52,7 @@ export interface FabricStateOptions {
   managedHost?: FabricManagedHostOptions;
   paths?: FabricRuntimePaths;
   runtimeLoader?: () => Promise<typeof import("./fabric-runtime-state.js")>;
+  entryIdentity?: FabricLoadedFileIdentity;
 }
 
 type ActivationHook = (context: ExtensionContext) => void | Promise<void>;
@@ -73,6 +75,7 @@ export class FabricState {
   readonly #externalComponents = new Map<string, FabricComponentDefinition>();
   readonly #options: FabricStateOptions;
   readonly #managedHost: FabricManagedHost | undefined;
+  readonly #entryIdentity: FabricLoadedFileIdentity | undefined;
   readonly activity = new FabricActivityStore();
   readonly prewalk = new PrewalkController();
   readonly prewalkDrift = new PrewalkDriftTracker();
@@ -86,6 +89,7 @@ export class FabricState {
   ) {
     this.#options = options;
     this.#managedHost = options.managedHost ? new FabricManagedHost(options.managedHost) : undefined;
+    this.#entryIdentity = options.entryIdentity;
   }
 
   get kernelReloadRequired(): boolean {
@@ -137,6 +141,7 @@ export class FabricState {
   resetSpeculation(): void { this.#runtime?.resetSpeculation(); }
   get agents(): FabricRuntimeState["agents"] { return this.#required().agents; }
   get actors(): FabricRuntimeState["actors"] { return this.#required().actors; }
+  get shellJobs(): FabricRuntimeState["shellJobs"] | undefined { return this.#runtime?.shellJobs; }
   get globalActors(): FabricRuntimeState["globalActors"] { return this.#required().globalActors; }
   get mesh(): FabricRuntimeState["mesh"] { return this.#required().mesh; }
   get compact(): FabricRuntimeState["compact"] { return this.#required().compact; }
@@ -257,6 +262,8 @@ export class FabricState {
   runHandoffAtBoundary(pending: PendingFabricHandoff, result: AgentToolResultMessage, context: ExtensionContext): Promise<Record<string, unknown>> {
     return this.#required().runHandoffAtBoundary(pending, result, context);
   }
+  get advisorsHalted(): boolean { return this.#current()?.advisorsHalted ?? false; }
+  haltAdvisors(): number { return this.#current()?.haltAdvisors() ?? 0; }
   noteMainActivity(context: ExtensionContext): void { this.#current()?.noteMainActivity(context); }
   dispatchHostEvent(event: FabricActorHostEvent, payload: unknown, context: ExtensionContext): number {
     return this.#current()?.dispatchHostEvent(event, payload, context) ?? 0;
@@ -425,6 +432,20 @@ export class FabricState {
             candidate.registerExternalComponent(component, { overwrite: true });
           }
         }
+        // Bootstrap stays cheap and may precede first use by minutes. Refresh only
+        // the component plane here; executor/language policy remains bootstrapped.
+        if (!this.#managedHost && !reinitialize) {
+          const { FabricComponentConfiguration } = await import("./components/configuration.js");
+          try {
+            config.components = new FabricComponentConfiguration({
+              cwd: context.cwd, agentDir: resolveAgentDir(), projectTrusted: () => context.isProjectTrusted(),
+            }).read().entries;
+          } catch (error) {
+            // Keep the bootstrapped manifest usable for repair. The live control
+            // plane records this read failure and watches for a corrected file.
+            if (context.hasUI) context.ui.notify(`Pi Fabric component configuration not applied: ${error instanceof Error ? error.message : String(error)}`, "error");
+          }
+        }
         await candidate.initialize(context, config);
         assertCurrent();
         for (const provider of this.#externalProviders.values()) {
@@ -475,6 +496,7 @@ export class FabricState {
         prewalkDrift: this.prewalkDrift,
         sessionApprovals: this.sessionApprovals,
         ...(this.#options.paths ? { paths: this.#options.paths } : {}),
+        ...(this.#entryIdentity ? { entryIdentity: this.#entryIdentity } : {}),
       },
     );
   }

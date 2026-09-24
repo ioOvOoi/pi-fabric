@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { commandAvailable } from "../src/agents/transports/process-utils.js";
@@ -58,6 +60,22 @@ describe("script runtime resolution", () => {
     expect(["node", "bun"]).toContain(path.basename(runtime).replace(/\.exe$/, ""));
   });
 
+  // A shell-based lookup silently finds nothing on Windows runners (no `sh`),
+  // which previously broke the bun-process executor there.
+  it("finds executables by scanning PATH without a shell", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-path-scan-"));
+    const probe = `fabric-path-probe-${process.pid}`;
+    const file = path.join(directory, process.platform === "win32" ? `${probe}.exe` : probe);
+    fs.writeFileSync(file, "", { mode: 0o755 });
+    const env = { ...process.env, PATH: directory + path.delimiter + (process.env.PATH ?? "") };
+    try {
+      expect(await commandAvailable(probe, env)).toBe(true);
+      expect(await commandAvailable(`${probe}-missing`, env)).toBe(false);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("throws a clear error when the bundled binary has no runtime and no override", () => {
     expect(() => resolveScriptRuntimeSync({ execPath: "/usr/local/bin/pi", env: {} })).toThrow(
       /requires a Node\.js or Bun runtime|PI_FABRIC_NODE_BINARY/,
@@ -71,5 +89,12 @@ describe("script runtime resolution", () => {
     expect(() =>
       resolveScriptRuntimeSync({ execPath: "/usr/local/bin/bun", requireNode: true }),
     ).toThrow();
+  });
+
+  it("launches TypeScript workers with bun so Node test hosts can boot src/worker.ts", async () => {
+    if (!await commandAvailable("bun")) return;
+    const args = await scriptSpawnArgs("src/worker.ts", ["--id", "x"]);
+    expect(path.basename(args[0]!).replace(/\.exe$/i, "")).toBe("bun");
+    expect(args[1]).toBe("src/worker.ts");
   });
 });

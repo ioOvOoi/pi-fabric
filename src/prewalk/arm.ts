@@ -1,10 +1,11 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricState } from "../fabric-state.js";
+import { resolveFabricIdentity } from "../main-agent.js";
 import {
   PREWALK_ARMED_MESSAGE_TYPE,
   hasPrewalkArmedPrompt,
   prewalkArmedPrompt,
-} from "./handoff.js";
+} from "./messages.js";
 
 // The single arm path shared by `/fabric prewalk` and alwaysRearm session
 // auto-arm, so drift baseline, hidden armed advisory, and status chip never
@@ -24,6 +25,7 @@ export const armFabricPrewalkSession = async (
     ...(input.task ? { task: input.task } : {}),
     ...(prewalk.thinking ? { thinking: prewalk.thinking } : {}),
     alwaysRearm: prewalk.alwaysRearm,
+    requirePlan: prewalk.requirePlan,
   });
   // Anchor the shell-write drift window at arm time so the first
   // bash-running boundary diffs against the pre-task tree state; only
@@ -34,7 +36,7 @@ export const armFabricPrewalkSession = async (
   // Hidden advisory framing, queued for the next prompt (rules before the
   // task when the caller submits one). nextTurn never triggers a turn;
   // custom messages never fire `input`, so observeTask ignores it.
-  const armedPrompt = prewalkArmedPrompt(prewalk.mode, input.model);
+  const armedPrompt = prewalkArmedPrompt(prewalk.mode, input.model, prewalk.requirePlan);
   if (!hasPrewalkArmedPrompt(context.sessionManager.getBranch(), armedPrompt)) {
     pi.sendMessage(
       {
@@ -49,7 +51,7 @@ export const armFabricPrewalkSession = async (
   context.ui.setStatus("fabric-prewalk", `armed (${prewalk.mode}) → ${input.model}`);
 };
 
-// alwaysRearm covers unarmed starts too: every session (and `/fabric reload`)
+// alwaysRearm covers unarmed starts too: every Main session (and `/fabric reload`)
 // opens armed, not only sessions following a completed handoff. Prerequisites
 // mirror the `/fabric prewalk` command gates, minus interactive model
 // selection — auto-arm is non-interactive and reads `prewalk.model`.
@@ -64,9 +66,27 @@ export const autoArmFabricPrewalk = async (
 ): Promise<string | undefined> => {
   const { prewalk } = state.config;
   if (prewalk.enabled === false || !prewalk.alwaysRearm) return undefined;
+  // Participants inherit Main's settings and full-code mode, but must execute
+  // their assigned work instead of handing it off again on their first write.
+  if (resolveFabricIdentity(context.sessionManager.getSessionId()).identity.kind !== "main") {
+    return undefined;
+  }
   // initialize() cancels any prior arm at session start; a non-idle status
   // means another path armed first — never clobber it.
   if (state.prewalk.status().state !== "idle") return undefined;
+  // A failed in-place return left Main on the executor: auto-arming now would
+  // hand the next mutation back to the same executor and capture it as the
+  // new boundary model, losing the original Main. restoreBorrowedInPlaceMain
+  // runs first at session start and reload, so this only triggers when that
+  // recovery also failed; an explicit /fabric prewalk arm still overrides.
+  const borrowed = state.prewalk.borrowedReturn();
+  if (
+    borrowed &&
+    context.model &&
+    `${context.model.provider}/${context.model.id}` === borrowed.executorModel
+  ) {
+    return "Fabric prewalk auto-arm skipped: Main is still on the executor after a failed in-place return. Restart the session or run /fabric reload to retry the return, or arm prewalk explicitly.";
+  }
   if (!state.config.fullCodeMode || state.config.schema.mode === "enforce") {
     return "Fabric prewalk auto-arm skipped: requires full code mode with Schema enforce mode disabled.";
   }

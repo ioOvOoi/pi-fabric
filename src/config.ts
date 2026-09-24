@@ -1,10 +1,14 @@
 import fs from "node:fs";
+import { DEFAULT_JEV_CONFIG, normalizeJevConfig, type FabricJevConfig } from "./jev/config.js";
+import { normalizeJevApprovalModel } from "./jev/model-key.js";
+export type { FabricJevConfig } from "./jev/config.js";
 import os from "node:os";
 import path from "node:path";
 import { renameAtomic } from "./core/atomic-write.js";
 import { quarantineDamagedFile } from "./core/damaged-file.js";
-import { normalizeModelAliases } from "./core/model-resolution.js";
+import { normalizeModelAliases, type FabricModelAliases } from "./core/model-resolution.js";
 import { PI_CORE_TOOL_NAME_SET } from "./core/pi-tools.js";
+import { DEFAULT_SHELL_HANG_MS, SHELL_HANG_MAX_MS } from "./core/shell-jobs.js";
 import {
   CURRENT_FABRIC_CONFIG_VERSION,
   migrateFabricConfigDocument,
@@ -52,6 +56,11 @@ interface FabricExecutorConfig {
   /** Exact-ref deadline floors (ms) for known long-running host calls, e.g.
    * "extensions.subagent". Keys are exact refs; no wildcard matching. */
   hostCallTimeouts: Record<string, number>;
+  /** Wait budget for nested pi.bash / pi.powershell (default 2m, max 10m).
+   * 0 disables auto-spill. After this, the await settles successfully with a
+   * live output path while the process keeps running. `background: true`
+   * detaches immediately. Explicit shell timeout remains a hard cap. */
+  shellHangMs: number;
   memoryLimitBytes: number;
   maxOutputChars: number;
   maxNestedResultChars: number;
@@ -81,6 +90,15 @@ interface FabricMcpCacheConfig {
   revalidateBudgetMs: number;
 }
 
+export interface FabricMcpJevConfig {
+  /** Opt-in Jev ranking for tools.search({ searchMode: "semantic" }). */
+  semanticSearch: boolean;
+  /** MCP servers whose tool metadata must not be sent to Jev. Empty allows every server, including ones not yet cached. */
+  blockedServers: string[];
+  semanticCandidateLimit: number;
+  semanticMinProbability: number;
+}
+
 export interface FabricMcpConfig {
   enabled: boolean;
   configPath?: string;
@@ -88,6 +106,7 @@ export interface FabricMcpConfig {
   allowDynamicServers: boolean;
   callTimeoutMs: number;
   cache: FabricMcpCacheConfig;
+  jev: FabricMcpJevConfig;
 }
 
 interface FabricClaudeRunnerConfig {
@@ -120,6 +139,11 @@ interface FabricPrewalkConfig {
   // Compact with the configured engine just before restoring Main's boundary
   // model after an in-place continuation settles.
   compactOnReturn: boolean;
+  // Frontier-first planning: the mutation boundary that would hand off instead
+  // asks Main to record its plan, and the handoff fires at the next mutation with
+  // that plan in the transcript. Upstream prewalk nudges the plan on turn one,
+  // before any discovery; this lands on the boundary, after it.
+  requirePlan: boolean;
   // Filesystem fallback trigger: when an armed boundary ran a successful
   // pi.bash or pi.powershell without an audited mutation, claim on stat-manifest drift so
   // shell heredocs / sed -i / formatter writes also hand off.
@@ -281,8 +305,8 @@ export interface FabricSpeculationConfig {
 
 
 export interface FabricModelsConfig {
-  /** Alias name → ordered provider/model fallback chain, first available wins. */
-  aliases: Record<string, string[]>;
+  /** Alias name → ordered provider/model fallback chain plus an optional default thinking level. */
+  aliases: FabricModelAliases;
 }
 
 export interface FabricConfig {
@@ -300,6 +324,7 @@ export interface FabricConfig {
   retention: FabricRetentionConfig;
   mesh: FabricMeshConfig;
   memory: FabricMemoryConfig;
+  jev: FabricJevConfig;
   entropy: FabricEntropyConfig;
   repairs: FabricRepairsConfig;
   schema: FabricSchemaConfig;
@@ -312,8 +337,13 @@ export interface FabricConfig {
 export const MAX_EXECUTOR_TIMEOUT_MS = 24 * 3_600_000;
 
 export const MIN_AGENT_TIMEOUT_MS = 1_000;
-const DEFAULT_AGENT_TIMEOUT_MS = 3_600_000;
 export const MAX_AGENT_TIMEOUT_MS = 24 * 3_600_000;
+/** Default per-run wall-clock budget. It equals the policy ceiling on purpose:
+ *  an orchestration program inherits agents.timeoutMs as its own whole-program
+ *  deadline floor, so any lower default truncates long participants at a
+ *  fraction of the maximum the policy already allows. Narrow one run by setting
+ *  agents.timeoutMs explicitly; per-call values can only raise it. */
+const DEFAULT_AGENT_TIMEOUT_MS = MAX_AGENT_TIMEOUT_MS;
 export const QUICKJS_MAX_MEMORY_LIMIT_BYTES = 0xffff_ffff;
 export const MAX_EXECUTOR_MEMORY_LIMIT_BYTES = Math.max(
   8 * 1024 * 1024,
@@ -338,6 +368,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     timeoutMs: 120_000,
     maxTimeoutMs: 900_000,
     hostCallTimeouts: {},
+    shellHangMs: DEFAULT_SHELL_HANG_MS,
     memoryLimitBytes: 64 * 1024 * 1024,
     maxOutputChars: 50_000,
     maxNestedResultChars: 2_000_000,
@@ -360,12 +391,19 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
       revalidate: "changed",
       revalidateBudgetMs: 60_000,
     },
+    jev: {
+      semanticSearch: false,
+      blockedServers: [],
+      semanticCandidateLimit: 127,
+      semanticMinProbability: 0.2,
+    },
   },
   prewalk: {
     mode: "in-place",
     alwaysRearm: false,
     compactOnReturn: true,
     detectShellWrites: true,
+    requirePlan: true,
   },
   agents: {
     enabled: true,
@@ -387,6 +425,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     sessionExport: true,
     sessionExportDir: "",
   },
+  jev: { ...DEFAULT_JEV_CONFIG, credentialCommand: [] },
   components: [],
   capture: {
     enabled: true,
@@ -550,8 +589,8 @@ const booleanValue = (value: unknown, fallback: boolean): boolean =>
   typeof value === "boolean" ? value : fallback;
 
 const boundedInteger = (value: unknown, fallback: number, min: number, max: number): number =>
-  typeof value === "number" && Number.isInteger(value)
-    ? Math.max(min, Math.min(max, value))
+  typeof value === "number" && Number.isFinite(value)
+    ? Math.max(min, Math.min(max, Math.floor(value)))
     : fallback;
 
 const boundedFloat = (value: unknown, fallback: number, min: number, max: number): number =>
@@ -657,6 +696,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const approvals = objectValue(input.approvals);
   const mcp = objectValue(input.mcp);
   const mcpCache = objectValue(mcp.cache);
+  const mcpJev = objectValue(mcp.jev);
   const prewalk = objectValue(input.prewalk);
   const agents = objectValue(input.agents);
   const claude = objectValue(agents.claude);
@@ -685,7 +725,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         (tool): tool is string => typeof tool === "string" && Boolean(tool),
       )
     : DEFAULT_FABRIC_CONFIG.agents.defaultTools;
-  const approvalModel = stringValue(approvals.model);
+  const approvalModel = normalizeJevApprovalModel(stringValue(approvals.model));
   const configPath = stringValue(mcp.configPath);
   const meshRoot = stringValue(mesh.root);
   const memoryIndexDir = stringValue(memory.indexDir);
@@ -806,6 +846,12 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         1_000,
         executorMaxTimeoutMs,
       ),
+      shellHangMs: boundedInteger(
+        executor.shellHangMs,
+        DEFAULT_FABRIC_CONFIG.executor.shellHangMs,
+        0,
+        Math.min(executorMaxTimeoutMs, SHELL_HANG_MAX_MS),
+      ),
       memoryLimitBytes: boundedInteger(
         executor.memoryLimitBytes,
         DEFAULT_FABRIC_CONFIG.executor.memoryLimitBytes,
@@ -864,6 +910,34 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
           600_000,
         ),
       },
+      jev: {
+        semanticSearch: booleanValue(
+          mcpJev.semanticSearch,
+          DEFAULT_FABRIC_CONFIG.mcp.jev.semanticSearch,
+        ),
+        blockedServers: Array.isArray(mcpJev.blockedServers)
+          ? [...new Set(
+              mcpJev.blockedServers.flatMap((name) => {
+                if (typeof name !== "string") return [];
+                const trimmed = name.trim();
+                return trimmed.length > 0 && trimmed.length <= 128 ? [trimmed] : [];
+              }),
+            )].slice(0, 256)
+          : [...DEFAULT_FABRIC_CONFIG.mcp.jev.blockedServers],
+        semanticCandidateLimit: boundedInteger(
+          mcpJev.semanticCandidateLimit,
+          DEFAULT_FABRIC_CONFIG.mcp.jev.semanticCandidateLimit,
+          2,
+          127,
+        ),
+        semanticMinProbability:
+          typeof mcpJev.semanticMinProbability === "number" &&
+          Number.isFinite(mcpJev.semanticMinProbability) &&
+          mcpJev.semanticMinProbability >= 0 &&
+          mcpJev.semanticMinProbability <= 1
+            ? mcpJev.semanticMinProbability
+            : DEFAULT_FABRIC_CONFIG.mcp.jev.semanticMinProbability,
+      },
     },
     prewalk: {
       ...(prewalk.enabled === false ? { enabled: false } : {}),
@@ -881,6 +955,10 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       detectShellWrites: booleanValue(
         prewalk.detectShellWrites,
         DEFAULT_FABRIC_CONFIG.prewalk.detectShellWrites,
+      ),
+      requirePlan: booleanValue(
+        prewalk.requirePlan,
+        DEFAULT_FABRIC_CONFIG.prewalk.requirePlan,
       ),
     },
     agents: {
@@ -951,6 +1029,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
           ? agents.sessionExportDir
           : DEFAULT_FABRIC_CONFIG.agents.sessionExportDir,
     },
+    jev: normalizeJevConfig(input.jev),
     components: configuredComponents.map((entry) => structuredClone(entry)),
     capture: {
       enabled: booleanValue(capture.enabled, DEFAULT_FABRIC_CONFIG.capture.enabled),
@@ -1276,7 +1355,7 @@ const planConfigFile = (filePath: string): FabricConfigFilePlan | undefined => {
   };
 };
 
-const writeJsonAtomic = (
+export const writeJsonAtomic = (
   filePath: string,
   document: Record<string, unknown>,
   expectedSource: string | null,

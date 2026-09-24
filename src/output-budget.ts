@@ -1,5 +1,5 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import fs from "node:fs/promises";
+import { closeScratch, createScratch } from "./storage/scratch.js";
 import path from "node:path";
 import { truncateMiddle } from "./util.js";
 
@@ -22,10 +22,16 @@ export interface BoundedModelOutput {
 type ArtifactWriter = (content: string) => Promise<string>;
 
 const writeOutputArtifact: ArtifactWriter = async (content) => {
-  const directory = await mkdtemp(path.join(tmpdir(), "pi-fabric-output-"));
-  const artifactPath = path.join(directory, "output.txt");
-  await writeFile(artifactPath, content, { encoding: "utf8", mode: 0o600 });
-  return artifactPath;
+  const directory = createScratch("output");
+  try {
+    const artifactPath = path.join(directory, "output.txt");
+    await fs.writeFile(artifactPath, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    closeScratch(directory);
+    return artifactPath;
+  } catch (error) {
+    await fs.rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
 };
 
 export const boundModelOutput = async (
@@ -48,9 +54,23 @@ export const boundModelOutput = async (
     ? `\n\n[Full output (${fullOutput.length} chars) saved to: ${artifactPath}]`
     : "";
   const bodyBudget = Math.max(1, maxChars - suffix.length);
-  const text = `${truncateMiddle(visible, bodyBudget)}${suffix}`;
+  const body = truncateMiddle(visible, bodyBudget);
+  let text = `${body}${suffix}`;
+  if (text.length > maxChars) {
+    // The suffix carries the artifact path; shrink the body again instead of
+    // cutting into the path. A truncation marker can itself exceed a tiny
+    // rebudget, so fall back to the bare suffix (or its tail), which always
+    // fits and still ends with the path.
+    const rebudget = maxChars - suffix.length;
+    if (rebudget <= 0) {
+      text = suffix.slice(-Math.max(1, maxChars));
+    } else {
+      const shrunk = truncateMiddle(body, rebudget);
+      text = shrunk.length + suffix.length <= maxChars ? `${shrunk}${suffix}` : suffix;
+    }
+  }
   return {
-    text: text.length <= maxChars ? text : truncateMiddle(text, maxChars),
+    text,
     ...(artifactPath ? { artifactPath } : {}),
     originalChars: fullOutput.length,
     omittedChars: Math.max(0, fullOutput.length - Math.min(fullOutput.length, bodyBudget)),

@@ -24,6 +24,11 @@ import {
 } from "./claude-cli.js";
 import { mapVedaTools, normalizeVedaModel } from "./veda-cli.js";
 import { resolvePiBinary } from "./pi-binary.js";
+import {
+  inheritedSessionPinsFromEnv,
+  serializeInheritedSessionPins,
+  type InheritedSessionPin,
+} from "./session-pins.js";
 import { tokenUsagePayloadFromValue } from "../lifecycle/types.js";
 import type { FabricTokenUsagePayload } from "../lifecycle/types.js";
 import { AgentAdmission, assertAgentTask, beginAgentSettlement, createAgentLifecycle, finishAgentSettlement, terminalAgentStatuses, type AgentLifecycleState } from "./lifecycle.js";
@@ -38,6 +43,7 @@ import type {
   FabricSteeringMode,
   FabricAgentLog,
   AgentHandleInfo,
+  AgentRunCarryOver,
   AgentRunRecord,
   AgentRunRequest,
   AgentRunResult,
@@ -46,9 +52,11 @@ import type {
   AgentTransportAdapter,
   AgentTransportHandle,
   AgentTransportLaunch,
+  AgentUsage,
 } from "./types.js";
 import { WorktreeManager } from "./worktree-manager.js";
 import { writeHandoffSession } from "./handoff.js";
+import type { FabricCompactionBudget } from "../compaction/hook.js";
 import {
   activeBudgetState,
   appendBudgetLedger,
@@ -61,9 +69,11 @@ import type { BudgetLedgerDetail } from "./budget-ledger.js";
 import type { BudgetLedgerState } from "./budget-ledger.js";
 import { readJsonlPage } from "../log-tail.js";
 import {
+  canRemoveManagedRunRoot,
   heartbeatRunRoot,
   markRunRootActive,
   markRunRootClosed,
+  removeEmptyRunRoot,
   sweepTempRunRoots,
 } from "../storage/retention.js";
 import { resolveSessionExportDir, sessionExportFileFor } from "./session-export.js";
@@ -73,6 +83,8 @@ import {
   type FabricLifecyclePublishRequest,
 } from "../lifecycle/types.js";
 import {
+  AGENT_RESUME_MAX_ATTEMPTS,
+  AGENT_RESUME_RETRY_BASE_DELAY_MS,
   AGENT_STARTUP_MAX_ATTEMPTS,
   AGENT_STARTUP_RETRY_BASE_DELAY_MS,
   AGENT_STATUS_POLL_INTERVAL_MS,
@@ -155,6 +167,15 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   adapter: AgentTransportAdapter;
   launch: AgentTransportLaunch;
   startupAttempts: number;
+  /** Mid-run resumes already spent on this run (see AGENT_RESUME_MAX_ATTEMPTS). */
+  resumeAttempts: number;
+  /** Set by an explicit stop — tool, dashboard, or session shutdown. A requested
+   *  stop is terminal and must never be resumed behind the operator's back. */
+  stopRequested: boolean;
+  /** Monotonic progress maxima seen for this run across attempts. The worker's
+   *  own terminal record keeps its counters, but a host-synthesized stop or
+   *  transport-death record resets them to zero, so recovery reads this. */
+  observedProgress: { turns: number; toolCalls: number; usage: AgentUsage };
   // The dead-transport failure we are retrying past; preferred over a bare
   // timed_out verdict if the run deadline lands mid-retry.
   lastRetriedTransportFailure?: AgentRunResult;
@@ -172,6 +193,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   latestRecord?: AgentRunRecord;
   latestUiRecord?: AgentRunRecord;
   background: boolean;
+  completionNotified?: boolean;
   lastLivenessCheckAt: number;
   /** Sum of tokens.usage deltas drained from the worker so far. Settle closes
    *  the gap against the status file's cumulative snapshot so the ledger total
@@ -188,6 +210,46 @@ const TRANSPORT_EXITED_WITHOUT_RESULT_PREFIX = "Agent transport exited without a
 
 const transportExitedWithoutResult = (error: string | undefined): boolean =>
   typeof error === "string" && error.startsWith(TRANSPORT_EXITED_WITHOUT_RESULT_PREFIX);
+
+/**
+ * A stop worth resuming: the worker caught a signal mid-run, or its transport
+ * died while the run still had work in flight. Timeouts and token-limit kills are
+ * policy verdicts, and an explicit stop is operator intent — none of them resume.
+ */
+const recoverableStop = (record: AgentRunRecord): boolean =>
+  record.status === "stopped" ||
+  (record.status === "failed" && transportExitedWithoutResult(record.error));
+
+const MAX_RESUME_NOTE_CHARS = 2_000;
+
+const setWorkerArgument = (args: string[], name: string, value: string): void => {
+  const index = args.indexOf(`--${name}`);
+  if (index >= 0) args[index + 1] = value;
+  else args.push(`--${name}`, value);
+};
+
+/**
+ * Task text a resumed attempt receives: the original task plus a bounded note
+ * naming the interruption, so a Pi child without a session file picks up where
+ * the stopped attempt left off instead of restarting blind.
+ */
+const resumeTask = (
+  task: string,
+  record: AgentRunRecord,
+  progress: { turns: number; toolCalls: number },
+  runDirectory: string,
+): string => {
+  const summary = summarizeRunLog(runDirectory, 6);
+  const turns = Math.max(record.turns, progress.turns);
+  const toolCalls = Math.max(record.toolCalls, progress.toolCalls);
+  const note = [
+    "[Fabric continuation] A previous attempt at this exact task was interrupted before it finished.",
+    `It ended with status "${record.status}"${record.error ? ` (${record.error})` : ""} after ${turns} turns and ${toolCalls} tool calls, so the working tree already contains what that attempt completed.`,
+    "Inspect the current state first, do not redo work that is already done, and carry the task through to completion.",
+    ...(summary ? [`Last observed run activity: ${summary}`] : []),
+  ].join(" ");
+  return `${note.slice(0, MAX_RESUME_NOTE_CHARS)}\n\n${task}`;
+};
 
 const retryablePiStartupError = (error: string | undefined): boolean =>
   typeof error === "string" &&
@@ -379,11 +441,16 @@ export class AgentManager {
   readonly #identityId: string | undefined;
   readonly #transports: Map<FabricAgentTransport, AgentTransportAdapter>;
   readonly #onBackgroundComplete: ((result: AgentRunResult) => void) | undefined;
+  readonly #onResultConsumed: ((id: string) => void) | undefined;
   readonly #onLifecycle: ((event: FabricLifecyclePublishRequest) => void) | undefined;
   readonly #preparePiModel:
     | ((model: string | undefined) => Promise<string | void>)
     | undefined;
+  readonly #resolveHandoffCompactionBudget:
+    | ((model: string | undefined, cwd: string) => Promise<FabricCompactionBudget>)
+    | undefined;
   readonly #resolveParticipantGuidance: AgentParticipantGuidanceResolver | undefined;
+  readonly #resolveInheritedSessionPins: (() => InheritedSessionPin[] | undefined) | undefined;
   readonly #piModelPreparations = new Map<string, Promise<string | undefined>>();
   readonly #budget: BudgetLedgerState | undefined;
   readonly #budgetOwned: boolean;
@@ -397,6 +464,11 @@ export class AgentManager {
     | { revision: number; value: Array<AgentRunRecord | AgentHandleInfo> }
     | undefined;
   #closing = false;
+  #closePromise: Promise<void> | undefined;
+  readonly #closeAbort = new AbortController();
+  readonly #spawns = new Set<Promise<AgentHandleInfo>>();
+  readonly #unregisteredTransports = new Set<AgentTransportHandle>();
+  readonly #launches = new Set<Promise<AgentTransportHandle>>();
 
   constructor(
     readonly cwd: string,
@@ -419,9 +491,12 @@ export class AgentManager {
       identityId?: string;
       retention?: FabricRetentionConfig;
       onBackgroundComplete?: (result: AgentRunResult) => void;
+      onResultConsumed?: (id: string) => void;
       onLifecycle?: (event: FabricLifecyclePublishRequest) => void;
       preparePiModel?: (model: string | undefined) => Promise<string | void>;
+      resolveHandoffCompactionBudget?: (model: string | undefined, cwd: string) => Promise<FabricCompactionBudget>;
       resolveParticipantGuidance?: AgentParticipantGuidanceResolver;
+      resolveInheritedSessionPins?: () => InheritedSessionPin[] | undefined;
     } = {},
   ) {
     this.#semaphore = new AgentAdmission(config.maxConcurrent, Infinity, config.maxDepth);
@@ -439,9 +514,12 @@ export class AgentManager {
     this.#vedaBinary =
       options.vedaBinary ?? process.env.PI_FABRIC_VEDA_BINARY ?? config.veda.binary;
     this.#onBackgroundComplete = options.onBackgroundComplete;
+    this.#onResultConsumed = options.onResultConsumed;
     this.#onLifecycle = options.onLifecycle;
     this.#preparePiModel = options.preparePiModel;
+    this.#resolveHandoffCompactionBudget = options.resolveHandoffCompactionBudget;
     this.#resolveParticipantGuidance = options.resolveParticipantGuidance;
+    this.#resolveInheritedSessionPins = options.resolveInheritedSessionPins;
     this.#currentDepth = Math.max(0, Number(process.env.PI_FABRIC_DEPTH ?? "0") || 0);
     this.#fullCodeMode = options.fullCodeMode ?? true;
     this.#kernel = options.kernel ?? (() => "typescript");
@@ -472,14 +550,7 @@ export class AgentManager {
     this.#transports = new Map(adapters.map((adapter) => [adapter.kind, adapter]));
     if (this.#managedTempRoot) {
       markRunRootActive(this.#runRoot);
-      sweepTempRunRoots({
-        tempRoot: os.tmpdir(),
-        currentRoot: this.#runRoot,
-        orphanedTempRunRetentionMs: this.#retention.orphanedTempRunMs,
-        oneShotRunRetentionMs: this.#retention.oneShotRunMs,
-      });
-      this.#retentionTimer = setInterval(() => this.#scheduleRetentionSweep(), RETENTION_SWEEP_INTERVAL_MS);
-      this.#retentionTimer.unref();
+      // Allocate ownership now; scan only on actual agent use or close.
     }
   }
 
@@ -509,6 +580,18 @@ export class AgentManager {
 
   resolveCwd(requestedCwd?: string): string {
     return resolveAgentCwd(this.cwd, requestedCwd);
+  }
+
+  #inheritedSessionPins(request: AgentRunRequest): InheritedSessionPin[] | undefined {
+    const explicit = request.inheritedSessionPins;
+    if (explicit && explicit.length > 0) return explicit;
+    const resolved = this.#resolveInheritedSessionPins?.();
+    if (resolved && resolved.length > 0) return resolved;
+    if (this.#currentDepth > 0) {
+      const fromEnv = inheritedSessionPinsFromEnv();
+      if (fromEnv.length > 0) return fromEnv;
+    }
+    return undefined;
   }
 
   /** Resolve once at the caller boundary, before launch or resident/trajectory handoff. */
@@ -545,7 +628,29 @@ export class AgentManager {
     return runtime;
   }
 
-  async spawn(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {
+  spawn(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {
+    if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
+    const pending = this.#spawn(request, signal);
+    this.#spawns.add(pending);
+    void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
+    return pending;
+  }
+
+  async #launchTransport(adapter: AgentTransportAdapter, request: AgentTransportLaunch): Promise<AgentTransportHandle> {
+    if (this.#closing) throw new Error("Fabric agent manager is closing");
+    const pending = adapter.launch(request);
+    this.#launches.add(pending);
+    try {
+      const transport = await pending;
+      // Includes launches that race close, before a ManagedAgent can own them.
+      this.#unregisteredTransports.add(transport);
+      return transport;
+    } finally {
+      this.#launches.delete(pending);
+    }
+  }
+
+  async #spawn(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {
     if (!this.config.enabled) throw new Error("Agents are disabled in Fabric configuration");
     if (this.#currentDepth >= this.config.maxDepth) {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
@@ -607,9 +712,11 @@ export class AgentManager {
         );
       }
     }
-    const release = await this.#semaphore.acquire("native", signal);
+    const admissionSignal = signal ? AbortSignal.any([signal, this.#closeAbort.signal]) : this.#closeAbort.signal;
+    const release = await this.#semaphore.acquire("native", admissionSignal);
     try {
       if (runner === "pi") model = await this.#prepareModel(model);
+      if (this.#closing) throw new Error("Fabric agent manager is closing");
       this.#semaphore.admit(this.#currentDepth + 1);
     } catch (error) {
       release();
@@ -619,6 +726,11 @@ export class AgentManager {
     const name = safeName(request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent");
     const runDirectory = path.join(this.#runRoot, id);
     fs.mkdirSync(runDirectory, { recursive: true });
+    if (this.#managedTempRoot && !this.#retentionTimer) {
+      this.#retentionTimer = setInterval(() => this.#scheduleRetentionSweep(), RETENTION_SWEEP_INTERVAL_MS);
+      this.#retentionTimer.unref();
+      this.#scheduleRetentionSweep();
+    }
     const taskFile = path.join(runDirectory, "task.txt");
     const statusFile = path.join(runDirectory, "status.json");
     const lifecycleFile = path.join(runDirectory, "lifecycle.jsonl");
@@ -665,6 +777,7 @@ export class AgentManager {
             path.join(runDirectory, "handoff-session"),
             request.thinkingTransfer,
             request.handoffCompact,
+            request.handoffCompact ? await this.#resolveHandoffCompactionBudget?.(model, agentCwd) : undefined,
           )
         : request.sessionFile;
       const adapter = await this.#resolveTransport(request.transport ?? this.config.transport);
@@ -675,6 +788,9 @@ export class AgentManager {
       const thinking = request.thinking ?? this.config.thinking;
       const recursive = runner === "pi" && request.recursive === true;
       const extensions = recursive ? true : (request.extensions ?? this.config.extensions);
+      const inheritedSessionPins = runner === "pi" && extensions
+        ? this.#inheritedSessionPins(request)
+        : undefined;
       // In a full-code parent every extension-enabled Pi child runs Fabric
       // through fabric_exec — not only recursively spawned agents. An explicit
       // extensions: false request opts the child back out to the native tool
@@ -749,6 +865,9 @@ export class AgentManager {
         ...(systemPrompt ? ["--system-prompt", systemPrompt] : []),
         ...(sessionFile ? ["--session-file", sessionFile] : []),
         ...(sessionExportFile ? ["--session-export-file", sessionExportFile] : []),
+        ...(inheritedSessionPins && inheritedSessionPins.length > 0
+          ? ["--inherited-session-pins", serializeInheritedSessionPins(inheritedSessionPins)]
+          : []),
         ...(request.actorId ? ["--actor-id", request.actorId] : []),
         ...(request.actorName ? ["--actor-name", request.actorName] : []),
         ...(request.capabilityRequirements
@@ -782,10 +901,12 @@ export class AgentManager {
         workerPath: this.#workerPath,
         workerArguments,
       };
-      const transport = await adapter.launch(launch);
+      if (this.#closing) throw new Error("Fabric agent manager is closing");
+      const transport = await this.#launchTransport(adapter, launch);
       const lifecycle = createAgentLifecycle<AgentRunResult>(release);
-      if (signal?.aborted) {
+      if (signal?.aborted || this.#closing) {
         await transport.stop();
+        if (!await transport.isAlive().catch(() => true)) this.#unregisteredTransports.delete(transport);
         throw new Error("Agent launch aborted");
       }
       const managed: ManagedAgent = {
@@ -823,13 +944,21 @@ export class AgentManager {
         settled: false,
         background: false,
         lastLivenessCheckAt: 0,
+        resumeAttempts: 0,
+        stopRequested: false,
+        observedProgress: {
+          turns: 0,
+          toolCalls: 0,
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+        },
         usageEmitted: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
       };
       if (signal) {
-        managed.abortHandler = () => void this.stop(id);
+        managed.abortHandler = () => this.#handleCallerAbort(id);
         signal.addEventListener("abort", managed.abortHandler, { once: true });
       }
       this.#runs.set(id, managed);
+      this.#unregisteredTransports.delete(transport);
       this.#invalidateUiList();
       void this.#monitor(managed, timeoutMs);
       return this.#handleInfo(managed, "running");
@@ -850,27 +979,84 @@ export class AgentManager {
     managed.background = false;
     if (!managed.settled) {
       if (!managed.result) throw new Error(`Agent ${id} has no pending result`);
-      return managed.result;
+      const result = await managed.result;
+      this.#onResultConsumed?.(id);
+      return result;
     }
     const record = readRecord(managed.statusFile) ?? managed.latestRecord;
     if (!record || !terminalStatuses.has(record.status)) {
       throw new Error(`Agent ${id} settled without a result`);
     }
+    this.#onResultConsumed?.(id);
     return this.#withTransportMetadata(record, managed) as AgentRunResult;
   }
 
   markForeground(id: string): void {
     this.#requireRun(id).background = false;
+    this.#onResultConsumed?.(id);
   }
 
   detachSignal(id: string): void {
-    const managed = this.#requireRun(id);
+    this.#detach(this.#requireRun(id), "caller detached; the run continues");
+  }
+
+  /**
+   * An abort belongs to the caller, not to the run it started: a returned guest
+   * program, a cancelled tool call, or a spent sandbox deadline must not discard
+   * hours of participant work. A run that already produced progress is detached
+   * and keeps going to a real terminal state; a run that never started working is
+   * still stopped, because releasing it loses nothing.
+   */
+  #handleCallerAbort(id: string): void {
+    const managed = this.#runs.get(id);
+    if (!managed || managed.settled || this.#closing) return;
+    if (!this.#observedWork(managed)) {
+      void this.stop(id);
+      return;
+    }
+    this.#detach(managed, "caller aborted; the run continues");
+  }
+
+  #detach(managed: ManagedAgent, reason: string): void {
+    const attached = managed.abortSignal !== undefined || managed.abortHandler !== undefined;
     if (managed.abortSignal && managed.abortHandler) {
       managed.abortSignal.removeEventListener("abort", managed.abortHandler);
     }
     managed.abortSignal = undefined;
     managed.abortHandler = undefined;
+    if (managed.background) return;
     managed.background = true;
+    // A fast worker may settle before agents.spawn returns and detaches it.
+    if (managed.settled) {
+      const record = readRecord(managed.statusFile) ?? managed.latestRecord;
+      if (record && terminalStatuses.has(record.status)) {
+        this.#notifyBackgroundComplete(managed, this.#withTransportMetadata(record, managed) as AgentRunResult);
+      }
+    }
+    if (attached) {
+      this.#emitLifecycle(managed, "run.detached", Date.now(), { data: { reason } });
+    }
+  }
+
+  #observedWork(managed: ManagedAgent): boolean {
+    const { turns, toolCalls } = managed.observedProgress;
+    if (turns > 0 || toolCalls > 0) return true;
+    const record = managed.latestRecord ?? readRecord(managed.statusFile);
+    return record !== undefined && (record.turns > 0 || record.toolCalls > 0);
+  }
+
+  /**
+   * Track element-wise maxima of the run's counters. Usage components only grow
+   * within a run, so a per-field maximum stays the cumulative total even when a
+   * host-synthesized stop or transport-death record resets the counters to zero.
+   */
+  #observeProgress(managed: ManagedAgent, record: AgentRunRecord): void {
+    const seen = managed.observedProgress;
+    if (record.turns > seen.turns) seen.turns = record.turns;
+    if (record.toolCalls > seen.toolCalls) seen.toolCalls = record.toolCalls;
+    for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost"] as const) {
+      if (record.usage[key] > seen.usage[key]) seen.usage[key] = record.usage[key];
+    }
   }
 
   status(id: string): AgentRunRecord | AgentHandleInfo {
@@ -943,6 +1129,9 @@ export class AgentManager {
 
   async stop(id: string): Promise<AgentRunResult> {
     const managed = this.#requireRun(id);
+    // A requested stop is terminal: record the intent before any transport work
+    // so recovery never restarts a run the operator, a tool, or shutdown ended.
+    managed.stopRequested = true;
     if (managed.settled) return this.wait(id);
     managed.background = false;
     const existing = readRecord(managed.statusFile);
@@ -966,6 +1155,7 @@ export class AgentManager {
   async cleanup(id: string, deleteBranch = false): Promise<{ cleaned: boolean }> {
     const managed = this.#requireRun(id);
     if (!managed.settled) throw new Error("Cannot clean up a running agent");
+    this.markForeground(id);
     const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
     if (!this.config.retainRuns) {
       await removeTree(managed.runDirectory);
@@ -1057,29 +1247,59 @@ export class AgentManager {
     return { queued: true, messageId };
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
     this.#closing = true;
+    this.#closeAbort.abort(new Error("Fabric agent manager is closing"));
+    return this.#closePromise ??= this.#close();
+  }
+
+  async #close(): Promise<void> {
     this.#uiListeners.clear();
     if (this.#retentionTimer) clearInterval(this.#retentionTimer);
     this.#retentionTimer = undefined;
     await this.#retentionSweep?.catch(() => undefined);
     const running = [...this.#runs.values()].filter((managed) => !managed.settled);
     await Promise.allSettled(running.map((managed) => this.stop(managed.id)));
-    await Promise.allSettled(running.map((managed) => this.#waitForTransportExit(managed)));
-    if (this.#managedTempRoot) {
-      markRunRootClosed(this.#runRoot);
-    } else if (!this.config.retainRuns) {
-      await removeTree(this.#runRoot);
+    await Promise.allSettled([...this.#spawns]);
+    await Promise.allSettled([...this.#launches]);
+    const all = [...this.#runs.values()];
+    await Promise.allSettled(all.map((managed) => this.#waitForTransportExit(managed)));
+    const transports = [...all.map((managed) => managed.transport), ...this.#unregisteredTransports];
+    const alive = await Promise.all(transports.map((transport) => transport.isAlive().catch(() => true)));
+    // A failed stop is not authority to delete a child's working files.
+    if (!alive.some(Boolean)) {
+      this.#unregisteredTransports.clear();
+      const storageSafe = !this.#managedTempRoot || canRemoveManagedRunRoot(this.#runRoot);
+      if (!this.config.retainRuns) {
+        if (storageSafe) {
+          await removeTree(this.#runRoot).catch(() => undefined);
+        }
+      } else if (this.#managedTempRoot) {
+        try { markRunRootClosed(this.#runRoot, Date.now(), true); } catch {}
+        removeEmptyRunRoot(this.#runRoot);
+      }
+      if (storageSafe && this.#budgetOwned && this.#budget) {
+        await removeTree(path.dirname(this.#budget.file)).catch(() => undefined);
+      }
     }
-    if (this.#budgetOwned && this.#budget) {
-      await removeTree(path.dirname(this.#budget.file));
-      clearOwnedBudgetEnv();
+    if (this.#budgetOwned) clearOwnedBudgetEnv();
+    if (this.#managedTempRoot) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      try {
+        sweepTempRunRoots({
+          tempRoot: os.tmpdir(),
+          currentRoot: this.#runRoot,
+          orphanedTempRunRetentionMs: this.#retention.orphanedTempRunMs,
+          oneShotRunRetentionMs: this.#retention.oneShotRunMs,
+        });
+      } catch {}
     }
   }
 
   #scheduleRetentionSweep(): void {
     if (this.#closing || this.#retentionSweep) return;
-    this.#retentionSweep = this.#runRetentionSweep().finally(() => {
+    this.#retentionSweep = new Promise<void>((resolve) => setImmediate(resolve))
+      .then(() => this.#closing ? undefined : this.#runRetentionSweep()).catch(() => undefined).finally(() => {
       this.#retentionSweep = undefined;
     });
   }
@@ -1151,6 +1371,56 @@ export class AgentManager {
     await delay(retryDelayMs);
     if (managed.settled || this.#closing || managed.abortSignal?.aborted) return false;
     managed.startupAttempts++;
+    return this.#relaunch(managed, record);
+  }
+
+  /**
+   * An unexpected mid-run stop — the worker caught a signal, or its transport
+   * died with work already done — is recoverable. Relaunch the same run in the
+   * same directory, seeded with the cumulative prefix of the attempt it lost, so
+   * a long participant finishes instead of reporting a terminal stop that throws
+   * away hours of work. Explicit stops, timeouts, and spent deadlines stay
+   * terminal; AGENT_RESUME_MAX_ATTEMPTS bounds the retries.
+   */
+  async #resumeStopped(
+    managed: ManagedAgent,
+    record: AgentRunRecord,
+    deadline: number,
+  ): Promise<boolean> {
+    if (
+      managed.settled ||
+      this.#closing ||
+      managed.stopRequested ||
+      managed.resumeAttempts >= AGENT_RESUME_MAX_ATTEMPTS ||
+      !this.#observedWork(managed) ||
+      !recoverableStop(record)
+    ) {
+      return false;
+    }
+    const retryDelayMs = AGENT_RESUME_RETRY_BASE_DELAY_MS * 2 ** managed.resumeAttempts;
+    if (Date.now() + retryDelayMs >= deadline) return false;
+    await this.#waitForTransportExit(managed);
+    await delay(retryDelayMs);
+    if (managed.settled || this.#closing || managed.stopRequested) return false;
+    managed.resumeAttempts += 1;
+    const { turns, toolCalls, usage } = managed.observedProgress;
+    return this.#relaunch(managed, record, {
+      task: resumeTask(managed.task, record, { turns, toolCalls }, managed.runDirectory),
+      carryOver: { turns, toolCalls, usage: { ...usage } },
+    });
+  }
+
+  /**
+   * Relaunch the same worker run in place. Shared by the startup retry (a child
+   * that died before producing a result) and the mid-run resume, which differ
+   * only in the task the child is handed and the cumulative prefix its fresh
+   * record starts from.
+   */
+  async #relaunch(
+    managed: ManagedAgent,
+    record: AgentRunRecord,
+    resume?: { task: string; carryOver: AgentRunCarryOver },
+  ): Promise<boolean> {
     try {
       if (managed.runner === "pi") {
         const model = await this.#prepareModel(managed.model);
@@ -1164,21 +1434,60 @@ export class AgentManager {
           delete managed.model;
         }
       }
+      if (resume) {
+        fs.writeFileSync(path.join(managed.runDirectory, "task.txt"), resume.task, {
+          encoding: "utf8",
+          mode: 0o600,
+        });
+        setWorkerArgument(
+          managed.launch.workerArguments,
+          "carry-over",
+          JSON.stringify(resume.carryOver),
+        );
+      }
+      // The relaunched child owns a fresh status/lifecycle pair, so drain what
+      // the previous attempt published (token usage above all) before discarding
+      // the journal it landed in.
+      this.#drainLifecycle(managed);
       fs.rmSync(managed.statusFile, { force: true });
-      managed.transport = await managed.adapter.launch(managed.launch);
+      if (managed.settled || this.#closing || managed.stopRequested) return false;
+      managed.transport = await this.#launchTransport(managed.adapter, managed.launch);
+      this.#unregisteredTransports.delete(managed.transport);
+      if (managed.settled || this.#closing || managed.stopRequested) {
+        // A stop landed while the relaunch was in flight. Release the child we
+        // just started so it cannot outlive the monitor and the stop path can
+        // publish its terminal record.
+        await managed.transport.stop().catch(() => undefined);
+        return false;
+      }
       delete managed.latestRecord;
       delete managed.latestUiRecord;
       managed.lastLivenessCheckAt = 0;
       managed.lifecycleOffset = 0;
       managed.lifecycleRemainder = Buffer.alloc(0);
       fs.rmSync(managed.lifecycleFile, { force: true });
+      if (resume) {
+        this.#emitLifecycle(managed, "run.resumed", Date.now(), {
+          data: {
+            attempt: managed.resumeAttempts,
+            attemptsAllowed: AGENT_RESUME_MAX_ATTEMPTS,
+            previousStatus: record.status,
+            ...(record.error ? { previousError: record.error } : {}),
+            carriedTurns: resume.carryOver.turns,
+            carriedToolCalls: resume.carryOver.toolCalls,
+          },
+        });
+      }
       this.#invalidateUiList();
       return true;
     } catch (error) {
       const retryError = error instanceof Error ? error.message : String(error);
       const failed = {
         ...record,
-        error: `${record.error ?? "Agent startup failed"} · retry launch failed: ${retryError}`,
+        // Keep the run's real progress: the relaunch failed, not the attempt.
+        turns: Math.max(record.turns, managed.observedProgress.turns),
+        toolCalls: Math.max(record.toolCalls, managed.observedProgress.toolCalls),
+        error: `${record.error ?? "Agent run failed"} · relaunch failed: ${retryError}`,
       };
       writeRecord(managed.statusFile, failed);
       managed.latestRecord = failed;
@@ -1193,6 +1502,7 @@ export class AgentManager {
       this.#drainLifecycle(managed);
       const record = readRecord(managed.statusFile);
       if (record) {
+        this.#observeProgress(managed, record);
         const previous = managed.latestRecord;
         managed.latestRecord = record;
         if (
@@ -1210,6 +1520,7 @@ export class AgentManager {
         managed.runnerSessionId = record.runnerSessionId;
       }
       if (record && terminalStatuses.has(record.status)) {
+        if (await this.#resumeStopped(managed, record, deadline)) continue;
         if (await this.#retryStartup(managed, record, deadline)) continue;
         this.#settle(managed, this.#withTransportMetadata(record, managed) as AgentRunResult);
         return;
@@ -1267,6 +1578,7 @@ export class AgentManager {
                 ? `Agent transport exited without a result; last run log: ${logSummary}`
                 : "Agent transport exited without a result",
             );
+            if (await this.#resumeStopped(managed, failed, deadline)) continue;
             if (await this.#retryStartup(managed, failed, deadline)) {
               managed.lastRetriedTransportFailure = failed;
               continue;
@@ -1312,12 +1624,18 @@ export class AgentManager {
     this.#invalidateUiList();
     finishAgentSettlement(managed, result);
     managed.task = "";
+    this.#notifyBackgroundComplete(managed, result);
+  }
+
+  #notifyBackgroundComplete(managed: ManagedAgent, result: AgentRunResult): void {
     if (
       managed.background &&
+      !managed.completionNotified &&
       !this.#closing &&
       this.config.notifyOnComplete &&
       this.#onBackgroundComplete
     ) {
+      managed.completionNotified = true;
       try {
         this.#onBackgroundComplete(result);
       } catch { /* completion callback must not break the manager */ }

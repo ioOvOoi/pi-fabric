@@ -1,15 +1,20 @@
 import type { SettingItem } from "@earendil-works/pi-tui";
+import { isJevApprovalModel } from "../jev/model-key.js";
+import { jevClassifierModels } from "../jev/routes.js";
 import type { SettingsSectionContext } from "./settings-section-context.js";
 import {
   setting,
   sectionSubmenu,
   numericSubmenu,
+  probabilitySubmenu,
   stringInputSubmenu,
   modelPickerSubmenu,
+  listSubmenu,
 } from "./settings-submenus.js";
 import {
   BOOLEANS,
   summaryFor,
+  formatBlockedCount,
   EXECUTOR_KERNELS,
   PYTHON_RUNTIMES,
   EXECUTOR_RUNTIMES,
@@ -88,6 +93,16 @@ export const buildExecutorSection = (
             formatMs,
             "Executor timeout",
             `Default wall-clock time for a single fabric_exec program (policy max ${formatMs(config.executor.maxTimeoutMs)}).`,
+          ),
+        }),
+        setting("executor.shellHangMs", "Shell hang", config.executor.shellHangMs === 0 ? "off" : formatMs(config.executor.shellHangMs), {
+          description: "Wait budget for nested pi.bash / pi.powershell (default 2m, max 10m). When it elapses the await succeeds with a live output path and pid while the process keeps running. 0 disables auto-spill. background: true detaches immediately. Explicit shell timeout stays a hard cap. ctrl+b twice spills early; ctrl+k kills the waiting command.",
+          submenu: numericSubmenu(
+            theme,
+            [0, 15_000, 30_000, 60_000, 120_000, 300_000, 600_000],
+            (ms) => ms === 0 ? "off" : formatMs(ms),
+            "Shell hang",
+            "Wait budget before a nested shell spills to a live log. 0 disables auto-spill. Max 10m.",
           ),
         }),
         setting(
@@ -231,20 +246,33 @@ export const buildApprovalsSection = (
       theme,
       "Approvals",
       "Approval policy for Fabric and model-requested native tool calls. Auto routes each call through a dedicated safety classifier and escalates uncertain actions to you.",
-      [
+      () => [
         setting("approvals.model", "Auto model", config.approvals.model || INHERIT_VALUE, {
           description:
-            "Pi model used as the auto-mode safety classifier. Inherit uses the active session model. The classifier has no executable tools and returns a structured allow-or-escalate verdict.",
+            "Pi or Jev model used as the auto-mode safety classifier. Inherit uses the active session model. Jev requires /login jev (TypeSafe), the existing openrouter credential (OpenRouter), or the existing vercel-ai-gateway credential (Vercel AI Gateway) and the configured minimum safety probability (default 0.50); lower scores and errors require explicit approval. No executable classifier tools.",
           submenu: modelPickerSubmenu(
             theme,
-            options.modelSource,
+            {
+              ...options.modelSource,
+              models: [
+                ...options.modelSource.models.filter(model => !isJevApprovalModel(`${model.provider}/${model.id}`)),
+                ...jevClassifierModels(config.jev.model),
+              ],
+            },
             {
               headerText:
-                "Safety classifier for auto approval policies. Pick Inherit to use the active Pi session model.",
+                "Safety classifier for auto approval policies. Inherit uses the active Pi model. Jev uses typed judgments, not chat; authenticate with /login jev for TypeSafe, /login openrouter for OpenRouter, or /login vercel-ai-gateway for Vercel AI Gateway.",
               inheritName: "Use the active Pi session model",
             },
           ),
         }),
+        ...(isJevApprovalModel(config.approvals.model) ? [
+          setting("jev.autoApprovalThreshold", "Jev minimum probability", String(config.jev.autoApprovalThreshold), {
+            description: "Minimum safety probability for automatic approval (0–1, default 0.50). Lower values allow more actions; secrets and destructive verdicts still escalate. Errors still require approval.",
+            submenu: probabilitySubmenu(theme, "Jev minimum probability",
+              "Enter a probability from 0 to 1 (default 0.50). Higher values are more conservative. 0 allows every judgment whose secrets and destructive verdicts are clean; 1 requires a probability of 1. Errors and missing user text still require approval."),
+          }),
+        ] : []),
         setting("approvals.read", "Read", config.approvals.read, {
           description: "Approval policy for read operations. Read is normally safe to leave allowed.",
           values: APPROVAL_MODES,
@@ -272,8 +300,33 @@ export const buildApprovalsSection = (
 };
 
 export const buildMcpSection = (
-  { config, theme, persist }: Pick<SettingsSectionContext, "config" | "theme" | "persist">,
+  { config, theme, persist, apply, options }: Pick<
+    SettingsSectionContext,
+    "config" | "theme" | "persist" | "apply" | "options"
+  >,
 ): SettingItem => {
+  const blockedItem = setting(
+    "mcp.jev.blockedServers",
+    "Block from Jev",
+    formatBlockedCount(config.mcp.jev.blockedServers.length),
+    {
+      description:
+        "Cached MCP servers. Toggle to block sending that server's tool metadata to Jev. Unlisted and future servers stay allowed.",
+    },
+  );
+  blockedItem.submenu = listSubmenu(
+    theme,
+    "mcp.jev.blockedServers",
+    "Block from Jev",
+    "Cached MCP servers. Toggle to block sending that server's tool metadata to Jev. Unlisted and future servers stay allowed.",
+    options.cachedMcpServers ?? [],
+    config.mcp.jev.blockedServers,
+    (selected) => {
+      apply("mcp.jev.blockedServers", selected);
+      blockedItem.currentValue = formatBlockedCount(selected.length);
+    },
+  );
+
   return setting("mcp", "MCP", summaryFor("mcp", config), {
     description: "Model Context Protocol provider discovery and invocation.",
     submenu: sectionSubmenu(
@@ -321,6 +374,12 @@ export const buildMcpSection = (
             "Wall-clock budget for the session-start background MCP revalidation.",
           ),
         }),
+        setting("mcp.jev.semanticSearch", "Jev semantic search", config.mcp.jev.semanticSearch ? "true" : "false", {
+          description:
+            'Opt-in: tools.search({ query, searchMode: "semantic" }) ranks actions with Jev. Default search stays lexical. Cached and future MCP servers are eligible unless blocked below.',
+          values: BOOLEANS,
+        }),
+        blockedItem,
       ],
       persist,
     ),

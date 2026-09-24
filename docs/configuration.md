@@ -53,6 +53,8 @@ Monty is always sandboxed, including under schema enforce, and does not require 
 
 Every raised deadline is capped by `executor.maxTimeoutMs` (default `900000`, i.e. 15 minutes: the former undocumented clamp, now explicit), which itself can be raised up to the hard implementation maximum of 24 hours. Values above a cap are visibly normalized down to the cap during config load and the effective values are shown in `/fabric` settings, never silently surprising. A per-invocation request or ref floor takes effect even when the ref is unknown to Fabric, so captured tools, MCP calls, and future host calls all run within an intentionally longer deadline without Fabric knowing their argument semantics. Existing `pi.bash` behavior (extending the deadline from an explicit `timeout` argument) is unchanged, and deadline expiry still cancels the active host call and any child process it owns.
 
+`executor.shellHangMs` (default `120000` / 2 minutes, max `600000` / 10 minutes, `0` disables) is a nested-shell wait budget, not a program deadline. When a `pi.bash` / `pi.powershell` await exceeds it, Fabric **settles the await successfully** (`ok: true`) with a still-running notice, pid, and live output path while the process keeps writing that file. `background: true` (alias `run_in_background`) detaches immediately with the same envelope. Inspect with `pi.read(logPath)` and stop by running `kill <pid>` through `pi.bash`. Do not poll. An explicit shell `timeout` remains a hard cap. **ctrl+b twice** spills early (tmux-safe); **ctrl+k** kills the waiting command. Session shutdown aborts leftover processes. Captured shell overrides normally keep their own execution semantics; an extension can opt into [Fabric-owned bash execution with middleware](shell-middleware.md) to preserve its environment/output filters while gaining the same background handling.
+
 The precedence across all sources is:
 
 ```text
@@ -77,6 +79,7 @@ where absent values do not participate. Orchestration programs (`agents.run` / `
     "timeoutMs": 120000,
     "maxTimeoutMs": 900000,
     "hostCallTimeouts": {},
+    "shellHangMs": 120000,
     "memoryLimitBytes": 67108864,
     "maxOutputChars": 100000,
     "maxNestedResultChars": 2000000,
@@ -147,7 +150,7 @@ where absent values do not participate. Orchestration programs (`agents.run` / `
     "maxConcurrent": 4,
     "maxPerExecution": 100,
     "maxDepth": 2,
-    "timeoutMs": 3600000,
+    "timeoutMs": 86400000,
     "extensions": true,
     "defaultTools": ["read", "bash", "edit", "write", "grep", "find", "ls"],
     "retainRuns": false,
@@ -196,11 +199,17 @@ where absent values do not participate. Orchestration programs (`agents.run` / `
 }
 ```
 
+## Jev System One
+
+`jev` configures TypeSafe typed judgments and session-owned foreground/background programs. It is enabled by default but makes no inference requests until called. `/login jev` stores API-key credentials through Pi; `TYPESAFE_API_KEY` and an explicitly configured `jev.credentialCommand` argv are also supported. Bare `jev.model` aliases use TypeSafe; `typesafe/...` or `~typesafe/...` model IDs use OpenRouter's decisions endpoint with the existing `openrouter` credential (`/login openrouter`, `OPENROUTER_API_KEY`, or `TYPESAFE_OPENROUTER_API_KEY`); `typesafe-ai/...` model IDs use Vercel AI Gateway's TypeSafe-compatible endpoint with the existing `vercel-ai-gateway` credential (`/login vercel-ai-gateway` or `AI_GATEWAY_API_KEY`). Never store the resolved secret in `fabric.json`.
+
+Host ceilings include `maxDurationMs`, `maxEvaluations`, `maxToolCalls`, `maxTokens`, `maxConcurrentRuns`, and `maxRetainedRuns`. Request controls are `model`, `requestTimeoutMs`, and `maxRequestBytes`. Per-program limits cannot raise these ceilings. See [Jev programs](jev.md) for defaults, typed schemas, cancellation, and the optional `browser-harness` component. Jev is unavailable in Schema enforce and managed-host modes.
+
 ## Components
 
 `components` is a root array of declarative supervised instances. Each `id` gives one instance a stable identity, and `component` names its definition in the versioned protocol. Fabric passes `config` to `activate(context, config)`. The `disabled` field removes an instance from the active graph and preserves its declaration. An empty array is the default, with a limit of 256 valid entries. The runtime installs enabled first-party providers as pinned `fabric.provider.*` components whose reserved IDs sit outside this array.
 
-Unknown definitions stay visible as waiting. They do not fail the Fabric runtime. Late discovery activates them. `/fabric reload` reconciles entry changes as a transaction. When a definition re-registers with `overwrite: true`, Fabric uses the same rollback-capable replacement path. See [components, effects, and committed capabilities](components.md).
+Unknown definitions stay visible as waiting. They do not fail the Fabric runtime. Late discovery activates them. Once the runtime is active, trusted file edits reconcile automatically without `/fabric reload`; idle bootstrap remains lazy and first use rereads the component configuration. Invalid live edits keep the last working state and are never repaired or renamed by the watcher. `components.describe`, `components.plan`, `components.apply`, and `components.reconcile` provide the same control plane to programs. Changes default to session scope; global/project persistence is explicit, and untrusted project writes are rejected, never redirected. Project component arrays replace global arrays; session overrides apply by ID on top. Definitions may declare `configSchema` for pre-activation validation. When a definition re-registers with `overwrite: true`, Fabric uses the same rollback-capable replacement path. See [components, effects, and committed capabilities](components.md#live-configuration-control).
 
 ## Speculation
 
@@ -212,7 +221,7 @@ Unknown definitions stay visible as waiting. They do not fail the Fabric runtime
 
 `prewalk.model` is the optional Pi `provider/model` that `/fabric prewalk` selects. `prewalk.mode` chooses how execution continues:
 
-- `"in-place"` (default) switches Main to the executor model, queues a hidden follow-up in the same session, and restores Main's boundary model when the continuation settles.
+- `"in-place"` (default) switches Main to the executor model, queues a hidden follow-up in the same session, and restores Main's boundary model when the continuation settles, when a new session inherited the executor, or when prewalk is cancelled.
 - `"trajectory"` forks the finalized outer Fabric call and result to a visible Pi child, then waits for it. After the child finishes, a hidden continuation asks Main to verify the work and report its findings.
 
 ```json
@@ -230,24 +239,27 @@ Unknown definitions stay visible as waiting. They do not fail the Fabric runtime
 
 `prewalk.thinking` sets the optional reasoning effort for the trajectory child executor. Its values are `off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`, clamped to each model's supported levels. When you leave it unset, the executor inherits `agents.thinking`. In-place mode keeps Main's session level.
 
-`prewalk.alwaysRearm` defaults to `false`. When enabled, prewalk returns to an armed, taskless state after each completed handoff (in-place return or trajectory completion). Every session then starts armed automatically, non-interactively from `prewalk.model`, and `/fabric reload` re-arms as well. `/fabric prewalk --off` cancels the armed state until the next session start or reload. Turns that settle without a handoff never disarm prewalk, regardless of this setting. The settings UI labels an unset model **Ask each time**. Non-interactive sessions must configure a model. In-place mode does not require child agents. Trajectory mode requires `agents.enabled`. It shows child spawn, progress, nested tools, metrics, and completion in Main's Fabric activity UI.
+`prewalk.alwaysRearm` defaults to `false`. When enabled, prewalk returns to an armed, taskless state after each completed handoff (in-place return or trajectory completion); a failed in-place return drops the arm without completing it. Every Main session then starts armed automatically, non-interactively from `prewalk.model`, and `/fabric reload` re-arms Main as well. Child agents and actors never auto-arm from inherited settings; explicit arming is unaffected. `/fabric prewalk --off` cancels the armed state until the next session start or reload. Turns that settle without a handoff never disarm prewalk, regardless of this setting. The settings UI labels an unset model **Ask each time**. Non-interactive sessions must configure a model. In-place mode does not require child agents. Trajectory mode requires `agents.enabled`. It shows child spawn, progress, nested tools, metrics, and completion in Main's Fabric activity UI.
 
-`prewalk.detectShellWrites` defaults to `true`. When armed, a `fabric_exec` boundary that ran a successful `pi.bash` or `pi.powershell` without an audited `pi.edit` / `pi.write` / `schema.commit` claims the handoff if file size or mtime stats drifted from the arm-time baseline. This routes shell heredocs and formatter binaries to the executor as well. The report's `trigger.files` lists the bounded drifted paths. Set it to `false` to accept audited mutations only.
+`prewalk.detectShellWrites` defaults to `true`. When armed, a `fabric_exec` boundary that ran a successful `pi.bash` or `pi.powershell` without an audited `pi.edit` / `pi.write` / `schema.commit` claims the handoff if file size or mtime stats drifted from the arm-time baseline. This routes shell heredocs and formatter binaries to the executor as well. The report's `trigger.files` lists the bounded drifted paths. An audited mutation consumes the shell-write drift window, so earlier edits cannot re-fire on a later read-only shell boundary. Fabric's own state directory never registers and does not consume the tracked-file cap. Other tool directories follow the project's ignore rules, so a Git work tree excludes them through `.gitignore`. Set this option to `false` to accept audited mutations only.
+
+`prewalk.requirePlan` defaults to `true`. An armed task owes a recorded plan before its mutation boundary can hand off, whether the trigger is an audited `pi.edit` / `pi.write` / `schema.commit` or shell drift under `detectShellWrites`. A boundary reached without a plan is withheld: Fabric delivers a hidden plan checkpoint to Main that asks for `prewalk.plan({ outcome, steps, verification, risks })` inside `fabric_exec`. That recorded plan is the readiness signal: Fabric snapshots it at claim time and delivers it in the executor's hidden continuation or child task, so delivery does not depend on the outer tool result surviving. The arm stays armed across the checkpoint and the frontier model keeps working. Fabric asks at most twice per task, then hands off unplanned with a visible warning so an armed session cannot stall. A recorded plan survives a failed handoff that returns to armed, and Fabric drops it when the captured task changes; cancelling, re-arming, or reloading Fabric resets readiness so the next task plans again. Checkpoint delivery is a hidden custom message, never a system prompt. Set this option to `false` to hand off on the first mutation. `prewalk.status` inside `fabric_exec` reports `planRequired`, `planReady`, and the reminder count for the current session.
 
 `prewalk.compactOnReturn` defaults to `true`. When an in-place continuation settles, Fabric requests a compaction with the configured `compaction.engine` and commits it while the executor is still the active model. Main's restored model receives the compacted transcript. Set this option to `false` when Main must receive the complete transcript.
 
-Each in-place handoff captures Main's active model at the boundary and restores it when the continuation settles. Pi's public `setModel` extension API also updates Pi's default model setting, so the restore returns the configured default to Main's model as well. A session that ends mid-continuation keeps the executor selection persisted until the next settle.
+Each in-place handoff captures Main's active model at the boundary and restores it when the continuation settles, when a new session is still on the executor, and when prewalk is cancelled (`/fabric prewalk --off` / `--disable`) or reloaded. A process that restarts while a continuation is still pending restores that captured model from the persisted continuation at the next session start, before the session auto-arms. Pi's public `setModel` extension API may also update the session model that a later session inherits, so restoring the captured Main model repairs that too. When the return itself fails, the arm is dropped, not re-armed and the failure is reported: the captured Main model is preserved so a later session start or `/fabric reload` retries the return, auto-arm is skipped while Main is still on the executor, and an explicit `/fabric prewalk` arm overrides.
 
 ## Models
 
-`models.aliases` names model selectors for `agents.switchModel` and for Pi-runner `model` arguments on `agents.run`, `agents.spawn`, `agents.create`, and `agents.handoff` (see [Agents](agents.md#switching-mains-session-model)). Each alias is either one `provider/model` target or an ordered fallback chain; resolution walks the chain and uses the first authenticated target. Alias names match case-insensitively and take priority over bare model ids and fuzzy matching. Aliases live in normal Fabric configuration, so a project `.pi/fabric.json` can extend the agent-level `fabric.json`; entries with malformed names or targets are ignored at load.
+`models.aliases` names model selectors for `agents.switchModel` and for Pi-runner `model` arguments on `agents.run`, `agents.spawn`, `agents.create`, and `agents.handoff` (see [Agents](agents.md#switching-mains-session-model)). Each alias is either one `provider/model` target, an ordered fallback chain, or an object `{"model": <target or chain>, "thinking": <level>}`. Resolution walks the chain and uses the first authenticated target. Alias names match case-insensitively and take priority over bare model ids and fuzzy matching. Aliases live in normal Fabric configuration, so a project `.pi/fabric.json` can extend the agent-level `fabric.json`; entries with malformed names or targets are ignored at load, and an unrecognized `thinking` level is dropped while the alias survives. An alias `thinking` level is the default effort for every run that selects it: an explicit `thinking` on the call or actor wins, and `agents.thinking` applies only when the alias sets none. `agents.switchModel` changes only the session model, so an alias thinking level does not apply there.
 
 ```json
 {
   "models": {
     "aliases": {
       "cheap": "google/gemini-2.5-flash",
-      "budget": ["openai/gpt-5-mini", "google/gemini-2.5-flash"]
+      "budget": ["openai/gpt-5-mini", "google/gemini-2.5-flash"],
+      "shallow": { "model": "google/gemini-2.5-flash", "thinking": "low" }
     }
   }
 }
@@ -356,7 +368,7 @@ Fabric risk classes are `read`, `write`, `execute`, `network`, and `agent`. Appr
 
 ### Auto approval mode
 
-An `auto` policy sends each validated call and its prepared arguments to a separate Pi model before invocation. Configure **Auto model** under `/fabric settings` → **Approvals**, or set the optional canonical `provider/model` key in `fabric.json`:
+An `auto` policy sends each validated call and its prepared arguments to a separate Pi model or Jev classifier before invocation. Configure **Auto model** under `/fabric settings` → **Approvals**, or set the optional canonical `provider/model` key in `fabric.json`:
 
 ```json
 {
@@ -376,15 +388,53 @@ The classifier receives the exact action, bounded prepared arguments, cwd, user-
 
 `deny` stays deterministic and runs before the classifier. Schema enforcement, project trust, budgets, and other host gates remain authoritative. Auto mode is a model-based policy advisor and provides no stronger sandbox boundary. Its initial conservative policy escalates destructive or irreversible actions, shared/external/production changes, credential or sensitive-data exposure, safety bypasses, actions beyond explicit user intent, and actions whose safety is uncertain. Fabric adapts the policy architecture described in Claude Code's [permission modes](https://code.claude.com/docs/en/permission-modes), [auto-mode configuration](https://code.claude.com/docs/en/auto-mode-config), and Anthropic's [auto-mode engineering write-up](https://www.anthropic.com/engineering/claude-code-auto-mode), adapted to Pi's model registry and Fabric's existing per-risk policy gate.
 
+### Jev as the auto-mode classifier
+
+Select a Jev entry in **Approvals → Auto model** after `/login jev` (TypeSafe route), `/login openrouter` (OpenRouter route), or `/login vercel-ai-gateway` (Vercel AI Gateway route), or configure:
+
+```json
+{
+  "approvals": {
+    "model": "pi-fabric/typesafe/jev-latest",
+    "write": "auto",
+    "execute": "auto",
+    "network": "auto",
+    "agent": "auto"
+  }
+}
+```
+
+Jev is an auth-only provider, not a chat model. This picker offers `pi-fabric/typesafe/jev-latest`, `pi-fabric/typesafe/jev-1.13`, `pi-fabric/typesafe/jev-1.13.0`, and `pi-fabric/typesafe/jev-preview` only in the approvals list, plus the configured `jev.model` if different. It also offers OpenRouter-served `pi-fabric/openrouter/jev-latest` and `pi-fabric/openrouter/jev-1.13`, which reuse the existing `openrouter` credential (`/login openrouter`, `OPENROUTER_API_KEY`, or `TYPESAFE_OPENROUTER_API_KEY`); OpenRouter has no `jev-preview` alias and serves Jev on its Decisions API, not `/chat/completions`. Vercel AI Gateway-served `pi-fabric/vercel-ai-gateway/jev-latest` reuses the existing `vercel-ai-gateway` credential (`/login vercel-ai-gateway` or `AI_GATEWAY_API_KEY`) and resolves to `typesafe-ai/jev` on the gateway's TypeSafe-compatible endpoint. Legacy `jev/<model-id>` overrides normalize to `pi-fabric/typesafe/<model-id>` when loaded. `/login jev` credentials and raw TypeSafe request IDs (`jev-latest`, `jev-1.13`) are unchanged. **Inherit** still means the active Pi chat model, never Jev. Selecting Jev for approvals is independent of `jev.enabled`, which controls Fabric's Jev tool provider.
+
+The host asks four typed Noul questions in one request: whether the exact action is safe to run without human approval, whether it touches secrets or sensitive data, whether it is destructive or irreversible without a user-named target, and whether it targets only artifacts this session created. Auto-allow requires the safety probability to be **at least `jev.autoApprovalThreshold` (default 0.50)** **and** the secrets and destructive probabilities to stay below 0.5; all four verdicts and the effective threshold are recorded with the decision. Selecting a Jev model reveals **Approvals → Jev minimum probability**, an editable number from 0 to 1 in both terminal and RPC settings. The setting persists in the selected global/project scope, remains saved when switching models, and applies only to Jev classification. For example, `"jev": { "autoApprovalThreshold": 0.95 }` requires a probability of at least 0.95. Missing, non-numeric, non-finite, or out-of-range configuration values use the 0.50 default; valid decimals and zero are preserved. Upgrading from the former fixed 0.99 cutoff uses 0.50 unless you explicitly configure another value.
+
+Lower thresholds permit more actions. **0 allows every valid judgment whose secrets and destructive verdicts are clean**, while 1 requires a safety probability of 1; a secrets or destructive probability at or above 0.5 escalates regardless of threshold, and so do missing user text, malformed answers, and errors. Reasons report the four numeric judgments and the effective threshold, not generated explanations. This is a policy cutoff, **not a calibrated security guarantee**. Use `ask` or `deny` when a probabilistic advisor is inappropriate.
+
+Jev receives the exact bounded arguments, the **latest user message and subsequent assistant tool calls**, and a bounded projection of earlier session actions - direct tool calls and nested Fabric actions with their arguments, host-recorded failures marked `"ok":false`. Earlier turns' prose, thinking, images, and tool outputs are excluded, so vague follow-ups cannot borrow authority from omitted history and retrieved content cannot instruct the classifier. Missing user text still requires explicit approval without inference. Oversized arguments, transcript clipping, and projection limits are disclosed to Jev as `evidence`/`session.truncated` facts without aborting classification (16,000 argument characters, 6,000 per user message/tool-call batch, 24,000 total evidence characters, 12,000 session-projection characters). Starting a new explicit user turn resets the conversational evidence window; the session-action projection spans the session.
+
+Selecting this remote classifier authorizes sending that evidence to TypeSafe; it can contain private paths, code, or values from tool arguments. Do not select it for data that must stay local. Classification is a host-side request, not a recursive `jev.evaluate` tool call, so it does not recursively invoke the network approval policy. Normal tool permissions still apply after classification. Missing auth, malformed answers, HTTP errors, cancellation and timeouts never fall back to another model or auto-allow. They use the existing explicit approval flow (or deny in headless mode).
+
+Authentication uses `/login jev`/`TYPESAFE_API_KEY` on the TypeSafe route, the existing `openrouter` credential (`/login openrouter`, `OPENROUTER_API_KEY`, or `TYPESAFE_OPENROUTER_API_KEY`) on the OpenRouter route, and the existing `vercel-ai-gateway` credential (`/login vercel-ai-gateway` or `AI_GATEWAY_API_KEY`) on the Vercel AI Gateway route, then trusted `jev.credentialCommand`; the command is resolved per classification and not cached across decisions. `jev.maxRequestBytes` and `jev.requestTimeoutMs` apply, with a 30-second classifier timeout ceiling and no automatic retries. Typed token usage is included in approval accounting. TypeSafe does not return prices: cost fields are zero/unpriced, **not evidence that inference is free**.
+
 ## Temporal retention
 
 Fabric clears inactive run artifacts by age. It never truncates active JSONL files. The defaults are:
 
-- `retention.orphanedTempRunMs`: remove a temporary run root six hours after its owner process dies. Active roots carry a heartbeat marker and are never removed.
-- `retention.oneShotRunMs`: retain terminal one-shot agent run artifacts for 24 hours. An explicit `agents.cleanup()` may remove them sooner. On every other path, graceful shutdown marks their temporary root closed for temporal cleanup.
+- `retention.orphanedTempRunMs`: reclaim a managed temporary run root six hours after a sweep **first notices** its owner is dead, provided its contents and descendant liveness can be verified. Live owners/descendants are preserved. Closed, shutdown-confirmed incomplete runs use the same grace from close.
+- `retention.oneShotRunMs`: retain terminal one-shot agent run artifacts for 24 hours. An explicit `agents.cleanup()` may remove them sooner. Graceful shutdown with `agents.retainRuns: true` marks managed roots closed; empty roots are removed immediately. `retainRuns: false` requests deletion after child transports stop, including for managed temporary roots.
 - `retention.actorRunArchiveMs`: retain terminal actor run archives for seven days. Fabric always preserves the latest run for each actor.
 
-Cleanup runs during active Fabric sessions and when a new top-level run manager starts. It never truncates active run logs or actor `session.jsonl` files. `/fabric settings` exposes all three values under **Retention**. Changing them requires `/fabric reload`.
+Run housekeeping begins on actual agent storage use (not manager startup), continues during use, and runs best-effort on close. It never applies cache pressure to agent runs or truncates their JSONL/actor `session.jsonl` files. Caller-owned run roots retain their existing explicit-cleanup semantics. Symlink roots/markers, wrong-uid files, malformed ownership, unknown contents, and unverifiable incomplete descendants are preserved. `/fabric settings` exposes all three values under **Retention**. Changing them requires `/fabric reload`.
+
+### Temporary output and reader scratch
+
+New model-output spills and shell logs use private directories with a versioned `.fabric-scratch.json` ownership marker. They expire 24 hours after completion; oldest eligible caches may be removed sooner above **128 MiB or 256 items**, pooled across these two classes. Completed output is protected for its first hour. These aggregate limits are **soft** while files are active/recent or cannot be safely attributed. Model-output artifacts remain complete (not truncated). Their links are temporary.
+
+Shell hang tracking keeps a **1 MiB RAM tail per running command**, then releases it on finish. Completed handles are capped at **256** and expire after 24 hours on subsequent store access. Each shell log is capped at **8 MiB including notices**; it starts with the retained pre-spill tail, not necessarily the command's beginning. The returned notice and log header explicitly say this is bounded, **not a full-output archive**; reaching the disk cap appends a truncation notice. Further output continues to the normal shell consumer but not the log. PID files are retired on finish; logs remain subject to the cache policy. A disk write error also stops logging without interrupting command execution; bounded logs never promise completeness.
+
+Reader checkpoints are lossless live state: they are **never pressure-evicted**. Dispose/finalization removes them normally. New marked scratch left by a killed host can be recovered only six hours after housekeeping first observes a dead owner; shell scratch additionally preserves a live recorded child PID. PID reuse and permission uncertainty preserve data. Sweeps are asynchronous, coalesced and throttled to once per minute on actual scratch allocation/close, with no idle startup scan. Nothing expires until a later storage use triggers housekeeping. Directory identity, file metadata and owner/child liveness are rechecked before removal; hardlinked files are excluded. `sweepScratch({ tempRoot, dryRun: true })` reports `eligible` and first-observed `orphaned` directories without deleting or updating markers.
+
+**Conservative recovery limits:** legacy unmarked output/shell/checkpoint artifacts are not automatically deleted. Shared recursion budget ledgers lack descendant ownership leases, and temporary actor roots may contain shared/adopted work; crash orphans of those two classes are deliberately left alone, not deleted merely because a parent PID is dead or old. Normal owned-budget/ephemeral-actor close cleanup remains in place (budget initialization failures now remove their partial allocation). Persistent/caller-owned actor roots are not cache sweep targets. Unverifiable legacy incomplete runs, unknown files, malformed markers, and symlinks likewise require an operator's ownership/liveness review; do not use a broad prefix deletion.
 
 ## Agents
 
@@ -400,12 +450,12 @@ Other agent settings:
 - `maxConcurrent`: global child concurrency semaphore.
 - `maxPerExecution`: hard cap on children per `fabric_exec` invocation.
 - `maxDepth`: nesting bound for child agent calls, including `rlm.query()`. It accepts any non-negative safe integer. A value of `0` disables child spawning. `/fabric settings` provides free-form numeric entry.
-- `timeoutMs`: default wall-clock budget per child and the floor for per-call overrides (60 minutes by default). Fabric ignores lower per-call values. Set `timeoutMs` only to request a longer run.
+- `timeoutMs`: default wall-clock budget per child and the floor for per-call overrides (24 hours by default, which is also the policy ceiling). Fabric ignores lower per-call values. The default matches the ceiling on purpose: an orchestration program inherits this value as its own whole-program deadline floor, so a lower default would cut a long participant short well inside the allowed maximum. Lower it to bound a class of runs, and raise a single run with a per-call value.
 - `extensions`: whether Claude children keep their normal Claude Code customizations.
 - `defaultTools`: the default tool allowlist for children.
 - `budgetUsd`: shared append-only cost ledger across a recursion tree (0 disables).
 - `maxTokensPerChild`: cumulative token bound per child (0 disables).
-- `notifyOnComplete`: send a follow-up completion message for a detached `agents.spawn()`.
+- `notifyOnComplete`: show concise detached `agents.spawn()` completion notices and batch unread results for Main at a safe tool-turn boundary (or wake idle Main). `wait`/`join` and terminal `status` retract pending notifications; running/UI status does not. Escape/error parks results until new input.
 - `sessionExport`: export each agent run's usage as an attributed pi-format session file (on by default).
 - `sessionExportDir`: override the export store root (default `~/.pi-fabric/agent`, with `PI_FABRIC_AGENT_DIR` taking precedence).
 
@@ -445,12 +495,17 @@ Fabric handles staleness in stale-while-revalidate style. Sessions adopt the cac
 - `mcp.cache.enabled`: turn the descriptor cache on (default: true). When false, discovery lists tools live with a 60s in-memory TTL, matching the pre-cache behavior.
 - `mcp.cache.revalidate`: background re-listing scope at session start, one of `"changed"` (only added or reconfigured servers, the default), `"all"`, or `"off"` (explicit `tools.list({ provider: "mcp", namespace })` probes still fetch exactly that server).
 - `mcp.cache.revalidateBudgetMs`: wall-clock budget for one background revalidation pass (default 60000). A leftover queue tail restarts with a fresh budget.
+- `mcp.jev.semanticSearch`: opt-in Jev ranking for `tools.search({ query, searchMode: "semantic" })` (default false). Default `tools.search` stays local and lexical. Enable it under **/fabric settings → MCP → Jev semantic search**.
+- `mcp.jev.blockedServers`: MCP servers whose tool metadata must not be sent to Jev. Empty (the default) allows every server, including ones that are not cached yet. **/fabric settings → MCP → Block from Jev** lists cached servers so you can opt individual ones out.
+- `mcp.jev.semanticCandidateLimit`: max tools sent to Jev (2–127, default 127). Half the slots are lexical hits; the rest recover tools the query would not name.
+- `mcp.jev.semanticMinProbability`: minimum head probability to accept a match (0–1, default 0.2). Below that, or if Jev chooses `none`, search abstains. Timeout, rate-limit, and 5xx responses fall back to lexical ranking and mark `backend.degraded`.
 
 See the [TypeScript MCP reference](../skillsets/typescript/fabric-exec/references/mcp.md) or [Python MCP reference](../skillsets/python/fabric-exec/references/mcp.md) for the selected call surface.
 
 ## UI
 
 - `ui.widget` is `auto`, `always`, or `hidden`. `auto` shows active or retained Fabric runs and worker activity. Active one-shot agents and actor workers occupy rows. Their recent nested tools appear beneath them when enabled.
+- `ui.maxRows` defaults to `6` and clamps the widget to `1..20` rows. The effective budget is also bounded by half the live terminal height, so a short pane or a tmux split cannot let the animated box fill the viewport and keep pi's scroll region moving under the editor. Rows beyond the budget collapse into a dim `+N` marker on the last line.
 - `ui.showAgentToolPreview` defaults to `true` and controls the child-agent and actor tool rows in both the parent `fabric_exec` card and the widget. Recursive agents render their full descendant tree, bounded by the preview depth/node budget. The version 2 config migration renamed this key from `ui.showNestedToolCalls`.
 - `ui.toolDisplay` is `"compact"` (default) or `"full"`. Compact elevates the declared display name and description and keeps bounded nested tool detail visible; full retains the outer Fabric program transcript. Pi's tool-expand keybinding (`ctrl+o` by default) expands a compact card to the full transcript and collapses it again. Invalid values fall back to `"compact"`. If configuration fails to load, rendering falls back to full so a degraded startup never hides the transcript. Change it under `/fabric settings` → **UI**; successful changes apply immediately to live and completed cards.
 - `ui.updateDebounceMs` defaults to `100`. It applies one execution-wide coalescing interval to every live `fabric_exec` card update: nested calls, progress text, and agent tool previews. Continuous streams emit at most once per interval, so a long call no longer postpones every render until completion. Set it to `0` to emit every update. Accepted values clamp to `0..2000`. The version 3 config migration renamed this key from `ui.nestedToolDebounceMs`.

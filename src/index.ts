@@ -1,4 +1,5 @@
 import type { Usage } from "@earendil-works/pi-ai";
+import { registerJevAuth } from "./jev/auth.js";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -15,15 +16,15 @@ import { registerFabricCommand } from "./commands/fabric.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import {
   comparableCompiledSurfaceScore,
-  compileEntropySurfaceAsync,
+  BackgroundEntropyCompiler,
+  BackgroundSessionSelector,
+  SessionObservationCache,
   entropyRepairRows,
   formatEntropyCompileNotice,
   liveSurfaceSnapshot,
   loadCompiledSurfaceAsync,
   loadObservationPoolAsync,
   machineSessionFilesAsync,
-  mergeObservationWindowAsync,
-  poolToValueObservations,
   saveCompiledSurfaceAsync,
   saveObservationPoolAsync,
   sessionWindowEvidenceAsync,
@@ -31,9 +32,13 @@ import {
 import { setActiveCompiledSurface } from "./entropy/active.js";
 import {
   filterPrewalkContinuationMessages,
-  settleInPlacePrewalk,
+  filterPrewalkPlanningDirectives,
   withTrajectoryRearmDirective,
-} from "./prewalk/handoff.js";
+} from "./prewalk/messages.js";
+import {
+  restoreBorrowedInPlaceMain,
+  settleInPlacePrewalk,
+} from "./prewalk/return.js";
 import type { PendingFabricHandoff } from "./prewalk/handoff.js";
 import { autoArmFabricPrewalk } from "./prewalk/arm.js";
 import {
@@ -92,6 +97,7 @@ import {
 import type { AgentToolResultMessage } from "./agents/types.js";
 import { FabricUiController } from "./ui/controller.js";
 import { installFabricEscapeHalt } from "./ui/escape-halt.js";
+import { installFabricShellHangKeys } from "./ui/shell-hang-keys.js";
 import { FabricToolDisplayController } from "./ui/tool-display.js";
 import { configureHighlighting } from "./ui/highlight.js";
 import { registerHandoffCompletionRenderer } from "./ui/handoff-completion.js";
@@ -99,6 +105,7 @@ import { formatFabricValue } from "./ui/structured.js";
 import { truncateMiddle } from "./util.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { captureLoadedFileIdentity } from "./build-identity.js";
 
 // Absolute path to the Fabric skills bundled with this extension. Resolved
 // relative to the extension entry so it works both in development (src/) and
@@ -115,6 +122,11 @@ const FABRIC_RUNTIME_PATHS = {
   skills: path.resolve(FABRIC_ENTRY_DIR, "..", "skillsets"),
 };
 const FABRIC_SKILLS_DIR = FABRIC_RUNTIME_PATHS.skills;
+
+// Loaded-code identity of this extension entry, captured while the module bytes
+// on disk are still the bytes this process evaluated. prewalk.status compares
+// it against the current file to expose stale-runtime reloads.
+const FABRIC_ENTRY_IDENTITY = captureLoadedFileIdentity(import.meta.url);
 
 const componentRegistrationFrom = (
   value: unknown,
@@ -160,6 +172,7 @@ export type { FabricManagedHostOptions } from "./managed-host.js";
 import type { FabricManagedHostOptions } from "./managed-host.js";
 
 export default async function piFabric(pi: ExtensionAPI, options: { managedHost?: FabricManagedHostOptions } = {}): Promise<void> {
+  if (!options.managedHost) registerJevAuth(pi);
   const codePreviewSettings = defaultCodePreviewSettings();
   const decorateShell: FabricToolShellDecorator = withCodePreviewShell;
   let compatibilityWarningShown = false;
@@ -169,7 +182,11 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   );
   const capturedTools = new CapturedToolCatalog();
   const proxyContract = new ProxyContractLedger();
-  const state = new FabricState(pi, capturedTools, { paths: FABRIC_RUNTIME_PATHS, ...(options.managedHost ? {managedHost: options.managedHost} : {}) });
+  const state = new FabricState(pi, capturedTools, {
+    paths: FABRIC_RUNTIME_PATHS,
+    ...(FABRIC_ENTRY_IDENTITY ? { entryIdentity: FABRIC_ENTRY_IDENTITY } : {}),
+    ...(options.managedHost ? {managedHost: options.managedHost} : {}),
+  });
   const directToolApproval = new FabricDirectToolApproval(
     pi,
     () => state.config,
@@ -309,21 +326,34 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   // user resumes by sending a new message (the "input" host event). Escape is
   // observed but not consumed, so Pi's native cancel-streaming still fires;
   // single ESC therefore stops the current turn and the advisor/supervisor
-  // actors at once. Disabled when mesh/actors are off or ui.haltOnEscape is
-  // false.
+  // actors and event-driven Jev observers at once. Jev observers are cancelled,
+  // not automatically restarted. Also works without mesh. ui.haltOnEscape opts out.
   let haltOnEscapeUnsubscribe: (() => void) | undefined;
+  let shellHangKeysUnsubscribe: (() => void) | undefined;
   const uninstallHaltOnEscape = (): void => {
     haltOnEscapeUnsubscribe?.();
     haltOnEscapeUnsubscribe = undefined;
   };
+  const uninstallShellHangKeys = (): void => {
+    shellHangKeysUnsubscribe?.();
+    shellHangKeysUnsubscribe = undefined;
+  };
   const installHaltOnEscape = (context: ExtensionContext): void => {
     uninstallHaltOnEscape();
-    if (!state.config.ui.haltOnEscape || !state.config.mesh.enabled) return;
+    if (!state.config.ui.haltOnEscape || (!state.config.mesh.enabled && !state.config.jev.enabled)) return;
     haltOnEscapeUnsubscribe = installFabricEscapeHalt(context, {
-      enabled: () => state.initialized && state.config.mesh.enabled && state.config.ui.haltOnEscape,
+      enabled: () => state.initialized && (state.config.mesh.enabled || state.config.jev.enabled) && state.config.ui.haltOnEscape,
       ownsInput: () => fabricUi.ownsInput,
-      halted: () => state.actors.halted,
-      halt: () => state.actors.haltAll().halted,
+      halted: () => state.advisorsHalted,
+      halt: () => state.haltAdvisors(),
+    });
+  };
+  const installShellHangKeys = (context: ExtensionContext): void => {
+    uninstallShellHangKeys();
+    shellHangKeysUnsubscribe = installFabricShellHangKeys(context, {
+      enabled: () => state.initialized,
+      ownsInput: () => fabricUi.ownsInput,
+      jobs: () => state.shellJobs,
     });
   };
 
@@ -344,6 +374,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
 
   const cleanupActivationSideEffects = (): void => {
     uninstallHaltOnEscape();
+    uninstallShellHangKeys();
     fabricUi.stop();
   };
   state.setActivationHook(async (context) => {
@@ -352,6 +383,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     applyFabricMode();
     fabricUi.start(context);
     installHaltOnEscape(context);
+    installShellHangKeys(context);
   }, cleanupActivationSideEffects);
 
   // Continual entropy reduction runs off the interaction path. Session-tree
@@ -362,6 +394,12 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   let entropyCompileInFlight: Promise<void> | undefined;
   let entropyCompilePending: EntropyCompileRequest | undefined;
   let entropyLifecycleEpoch = 0;
+  const createEntropyCaches = () => ({
+    compiler: new BackgroundEntropyCompiler(),
+    observations: new SessionObservationCache(),
+    sessions: new BackgroundSessionSelector(machineSessionFilesAsync),
+  });
+  let entropyCaches = createEntropyCaches();
 
   interface EntropyCompileRequest {
     context: ExtensionContext;
@@ -379,27 +417,28 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     const agentDir = resolveAgentDir();
     const cwd = state.cwd ?? context.cwd;
     const repairs = entropyRepairRows(state.repairs.repairs);
+    const caches = entropyCaches;
     const [files, loaded, poolLoaded, snapshot] = await Promise.all([
-      machineSessionFilesAsync(agentDir, cwd),
+      caches.sessions.select(agentDir, cwd, context.sessionManager.getSessionFile?.()),
       loadCompiledSurfaceAsync(agentDir),
       loadObservationPoolAsync(agentDir),
       liveSurfaceSnapshot({ registry: state.registry, extensionContext: context, cwd }),
     ]);
     if (!current() || loaded.error) return;
-    const evidence = await sessionWindowEvidenceAsync(files);
+    const evidence = await sessionWindowEvidenceAsync(files, { windowsOnly: true });
     if (!current()) return;
-    const mergedPool = await mergeObservationWindowAsync(
+    const mergedPool = await caches.observations.merge(
       poolLoaded.file,
       evidence.observationWindows,
     );
-    if (!poolLoaded.error) await saveObservationPoolAsync(agentDir, mergedPool.file);
+    if (!poolLoaded.error && (mergedPool.mergedSessions > 0 || !poolLoaded.file)) {
+      await saveObservationPoolAsync(agentDir, mergedPool.file);
+    }
     if (!current()) return;
-    const outcome = await compileEntropySurfaceAsync({
-      traces: evidence.traces,
+    const outcome = await caches.compiler.compile({
+      windows: evidence.traceWindows,
       surface: snapshot,
       repairs,
-      valueObservations: poolToValueObservations(mergedPool.file),
-      auditCalls: evidence.auditCalls,
       ...(loaded.file ? { artifact: loaded.file } : {}),
     });
     if (!current()) return;
@@ -467,12 +506,14 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
 
   pi.on("session_start", async (_event, context) => {
     entropyLifecycleEpoch += 1;
+    entropyCaches = createEntropyCaches();
     entropyEvidenceThisTurn = false;
     entropyCompilePending = undefined;
     pendingHandoffs.clear();
     directToolApproval.clear();
     toolDisplay.clear();
     uninstallHaltOnEscape();
+    uninstallShellHangKeys();
     fabricUi.stop();
     suspendToolCapture();
     proxyContract.reset();
@@ -486,6 +527,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       }
     }
     await state.bootstrap(context);
+    // bootstrap() cancels any live arm; the borrowed Main model survives so a
+    // new session that inherited the in-place executor can snap back.
+    await restoreBorrowedInPlaceMain(state.prewalk, pi, context);
     refreshCodePreviewSettings();
     applyFabricMode();
     if (state.shouldEagerlyActivate(context)) await state.ensure(context);
@@ -659,12 +703,14 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       "success" in event.message.details
         ? { ...event.message.details, success: boundarySucceeded }
         : event.message.details;
+    // `details` is optional on ToolResultMessage; under exactOptionalPropertyTypes
+    // an explicitly `undefined` property is rejected, so omit the key instead.
     return {
       message: {
         ...event.message,
         content: [{ type: "text", text }],
-        details,
         isError: !boundarySucceeded,
+        ...(details === undefined ? {} : { details }),
       },
     };
   });
@@ -720,13 +766,24 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
 
   pi.on("context", (event, context) => {
     const sessionId = context.sessionManager.getSessionId();
+    const pendingContinuation = state.initialized
+      ? state.prewalk.pendingContinuationMessage(sessionId)
+      : undefined;
     const continuation = filterPrewalkContinuationMessages(
       event.messages,
       (continuationId) => state.initialized &&
         state.prewalk.acceptContinuation(sessionId, continuationId),
+      pendingContinuation,
     );
-    let changed = continuation.changed;
-    const messages = continuation.messages.map((message) => {
+    // Planning directives are phase-scoped: visible only while this session's
+    // arm is live (Main still owes its plan). A claimed handoff or an off arm
+    // must not project stale planning instructions into later requests.
+    const planning = filterPrewalkPlanningDirectives(
+      continuation.messages,
+      state.initialized && state.prewalk.isArmed(sessionId),
+    );
+    let changed = continuation.changed || planning.changed;
+    const messages = planning.messages.map((message) => {
       if (message.role !== "user") return message;
       if (typeof message.content === "string") {
         const content = expandSkillDirMarkersInSkillBlock(message.content);
@@ -860,6 +917,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     }
     await settleEntropyCompiles();
     entropyLifecycleEpoch += 1;
+    entropyCaches = createEntropyCaches();
     entropyCompilePending = undefined;
     unsubscribeComponentRegistration();
     unsubscribeProviderRegistration();
@@ -870,6 +928,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       await state.shutdown();
     } finally {
       uninstallHaltOnEscape();
+      uninstallShellHangKeys();
       fabricUi.stop();
       suspendToolCapture();
       toolOwnership.release();

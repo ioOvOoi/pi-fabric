@@ -19,8 +19,8 @@ QuickJS is isolated by default and receives static type checking; native Node/Bu
 | Tool | Form | Returns |
 |------|------|---------|
 | `read` | `path` \| `{path,offset?,limit?}` \| `(path, options?)` | `string` |
-| `bash` | `command` \| `{command,timeout?,cwd?}` \| `(command, options?)` | `{ok:true,output,details}`; rejects on a nonzero exit (`settle:true` returns `{ok:false,output,details:null,exitCode,error}` instead) |
-| `powershell` | Windows only; same forms and result contract as `bash` | `{ok:true,output,details}`; supports `settle:true` |
+| `bash` | `command` \| `{command,timeout?,cwd?,settle?,background?}` \| `(command, options?)` | `{ok:true,output,details}`; rejects on a nonzero exit (`settle:true` returns `{ok:false,...}`; `background: true` detaches immediately with a still-running envelope) |
+| `powershell` | Windows only; same forms and result contract as `bash` | `{ok:true,output,details}`; supports `settle:true` and `background: true` |
 | `grep` | `pattern` \| `{pattern,path?,glob?,ignoreCase?,literal?,context?,limit?}` \| `(pattern, path?, limit?)` | `string` |
 | `find` | `pattern` \| `{pattern,path?,limit?}` \| `(pattern, path?, limit?)` | `string` |
 | `ls` | `path?` \| `{path?,limit?}` \| `(path, options?)` | `string` |
@@ -31,7 +31,7 @@ QuickJS is isolated by default and receives static type checking; native Node/Bu
 
 For `pi.edit`, entry-level `all:true` applies that replacement to every non-overlapping occurrence; top-level `all:true` applies every entry that way. Omit it for unique anchors.
 
-Shell tools reject on an ordinary nonzero exit; pass `settle:true` to get `{ok:false,output,details:null,exitCode,error}` instead of a rejection. Timeout, cancellation, approval, security, and spawn failures still reject. Other Pi core tool errors reject normally.
+Shell tools reject on an ordinary nonzero exit; pass `settle:true` to get `{ok:false,output,details:null,exitCode,error}` instead of a rejection. `background: true` (alias `run_in_background`) returns immediately with `ok: true`, a pid, and a live output path while the process keeps running — do not poll; `pi.read` the path when you need output, or `kill <pid>`. Nested shells that exceed `executor.shellHangMs` (default 2m) auto-spill the same way. Timeout, cancellation, approval, security, and spawn failures still reject. Other Pi core tool errors reject normally.
 
 Aliases are normalized to canonical fields before host validation. Command aliases include `cmd`/`shell`/`cmdline`/`script`/`commandLine`; pattern aliases include `query`/`regex`/`search` plus `q`/`expression`/`text` for grep and `name`/`filename`/`glob`/`include` for find. Path aliases include `file`, `file_path`, camel-case path variants, `dir`/`folder`/`directory`, and target-file variants. Edit text accepts `old`/`from`/`old_string`-style and `new`/`to`/`replacement`/`new_string`-style spellings, including inside `edits`; write content accepts `contents`/`body`/`text`/`data`/`fileContent`. `ic`/`caseInsensitive`→`ignoreCase`, `globPattern`→`glob`, `ctx`→`context`, `max`→`limit`, and `start`→`offset`.
 
@@ -80,13 +80,25 @@ All calls return promises. Fields ending in `?` are optional; `unknown` marks pr
 | `schema.verify(args)` | `{verified,hypothesisId,certificate?,issuedAt?,expiresAt?,reason?,results}` |
 | `schema.commit(args)` | `{outcome,transactionId,generation?,paths?,postconditions?,complexityReductionCertified?,stateTransition?,error?,rollbackError?}` |
 | `schema.abort(args)` | `{aborted:true,hypothesisId}` |
-| `components.list()` | `{definitions:Array<{name,description?,revision,requirements,provisions}>,components:FabricComponentInfo[]}` |
+| `components.list()` | `{definitions,components,configuration:{sources,warnings,sessionOverrides,removalPolicy,error?}}`; ignored trust layers and live-reconcile failures are explicit |
+| `components.describe({component})` | Definition metadata, optional `configSchema`, and instances; works before activation |
+| `components.plan({scope?,entries?,remove?,reset?})` | `{revision,request,changes,warnings,sources}`; validates without activation or writes |
+| `components.apply({...plan.request,expectedRevision:plan.revision})` | Applies immediately; session scope by default, persistence only with explicit global/project scope; unrestricted host callers only |
+| `components.reconcile()` | Re-reads trusted component config without host reload; session overrides remain |
 | `components.status({id})` | `FabricComponentInfo` with state, requirements, provisions, targetDigest?, error?, cleanupErrors? |
 | `components.graph()` | `{components:FabricComponentInfo[],edges:Array<{from,to,ref}>,cycles:string[][]}` |
 | `components.reload({id?}?)` | `{components:FabricComponentInfo[]}`; rolls back activation failure when cleanup succeeds |
 | `compact.request(args?)` | `{requested:true,intent:{reason?,instructions?,preserve?,requestedBy,requestedAt}}` |
 | `compact.status()` | `{pending?:CompactIntent,last?:{at,requestedBy,status,summary?,tokensBefore?,estimatedTokensAfter?,error?}}` |
 | `compact.cancel()` | `{cancelled:true}` |
+| `jev.evaluate(args)` | `{model,answers,usage:{input_tokens,output_tokens}}`; typed Choice/Noul/Score answers, not generated text |
+| `jev.run({program,input})` | terminal `FabricJevRun`: `{id,state,result?,error?,evaluations,toolCalls,usage,events,nextSequence,logs,...}` |
+| `jev.spawn({program,input,observe?})` | `FabricJevRun` initially `running`; session-owned, not restart-durable |
+| `jev.status(args?)` | without id: `{credentials:{configured,source,verified},model,runs}`; `{id,after?}`: run envelope with bounded events after sequence |
+| `jev.wait({id})` | terminal run envelope; cancelling the wait does not stop the run |
+| `jev.join({id})` | alias for `jev.wait`, with the same arguments, result, and cancellation behavior |
+| `jev.advise({id,eventId,message})` | `{delivered,reason?}`; current observed event only; explicit delivery, agent approvals, freshness and feedback gates apply |
+| `jev.stop({id})` | terminal run envelope after cancellation/cleanup; no rollback of already-issued effects |
 
 `memory.recall` multi-term literal queries default to ranked `queryMatch: "any"` so wording differences do not hide evidence; use `"all"` to require every canonical term in one indexed entry, and `queryMode: "phrase"` when adjacency matters. Results are hard-bounded either way. Structural filters (`ref`, `provider`, `action`, `outcome`) use exact persisted trace fields. Use `tools.catalog()`/`tools.search()` only to choose a current action head—catalog descriptions are navigation metadata and never become session evidence.
 
@@ -107,12 +119,20 @@ Stable-provider arguments normalize near-miss spellings the way `pi.*` does: kno
 The guest TypeScript declarations contain the complete argument and return contracts. For a discovered or dynamic action, use `tools.describe({ref})`; inspect `outputSchema` when supplied, otherwise treat the result as `unknown`.
 
 ## `tools` — discovery & generic calls
-Refs are namespaced (`pi.grep`, `extensions.<tool>`, `mcp.<server>.<tool>`, `schema.<action>`, `components.<action>`); bare names are rejected. `tools.providers()`→`[{name,description}]` · `tools.catalog({provider?,limit?})`→current provider/action head tree (navigation metadata, not session evidence) · `tools.search({query,limit?})`→`FabricAction[]`(`ref,name,description,inputSchema,risk`) · `tools.describe({ref})`→full `FabricAction` (read `inputSchema` first) · `tools.call({ref,args?})` · `tools.list({provider?,namespace?,query?,limit?})` · `tools.models()`→Pi `[{provider,id,name,key}]`; `agents.models({runner:"claude"})`→Claude Code runtime models with canonical `claude/<value>` keys. Use `tools.call()` for refs discovered or computed at runtime, or names that cannot use property access—not as the default for known actions. Calling a core-tool name on `tools` (e.g. `tools.read(...)`) throws with a hint to use `pi.read(...)`.
+Refs are namespaced (`pi.grep`, `extensions.<tool>`, `mcp.<server>.<tool>`, `schema.<action>`, `components.<action>`); bare names are rejected. `tools.providers()`→`[{name,description}]` · `tools.catalog({provider?,limit?})`→current provider/action head tree (navigation metadata, not session evidence) · `tools.search({query,limit?,searchMode?})`→`FabricAction[]` or, with `searchMode:"semantic"` (opt-in in /fabric settings → MCP), `{kind:"pi-fabric.action-search",actions,backend}` · `tools.describe({ref})`→full `FabricAction` (read `inputSchema` first) · `tools.call({ref,args?})` · `tools.list({provider?,namespace?,query?,limit?})` · `tools.models()`→Pi `[{provider,id,name,key}]`; `agents.models({runner:"claude"})`→Claude Code runtime models with canonical `claude/<value>` keys. Use `tools.call()` for refs discovered or computed at runtime, or names that cannot use property access—not as the default for known actions. Calling a core-tool name on `tools` (e.g. `tools.read(...)`) throws with a hint to use `pi.read(...)`.
 
 ## Error recovery: read, describe, retry
 Read the line-numbered error → `await tools.describe({ref})` for the schema → match `inputSchema`, rerun (don't guess). Common mistakes: bare ref (`grep`→`pi.grep`); a non-object second arg on `read`/`bash`/`powershell`/`ls` (`(primary, optionsObject)` already merges on the string-primary tools; positional tuples exist only for `grep`/`find`/`write`/`edit`).
 
+## Jev judgments and persistent programs
+
+`jev.evaluate` supplies typed semantic judgments. `jev.run`/`jev.spawn` execute one TypeScript artifact with schemas, limits, and exact `requires`; local state persists across loop iterations without a reasoning-model turn per tick. Credentials stay host-side: `/login jev`/`TYPESAFE_API_KEY` for direct aliases, the existing openrouter credential for `typesafe/…` ids, the existing `vercel-ai-gateway` credential for `typesafe-ai/…` ids, or a trusted credential command; `jev.status()` never retrieves a key. Jev is unavailable in Schema enforce and managed hosts.
+
+For guided authoring, recommend `/skill:fabric-jev`. This advanced skill is user-invoked; never load it autonomously. Only after direct invocation, `<skill-dir>/../fabric-jev/SKILL.md` is its workflow pointer. `<skill-dir>/../../../docs/jev.md` is a branch pointer for exact API, budget, auth, and Browser Harness details when those surfaces are needed. Confidence is not permission to act; state is sent to TypeSafe and consumes credits.
+
 ## Orchestration surfaces (opt-in)
+
+`wait` is canonical for agents and Jev. `agents.join({id})` aliases `agents.wait({id})`; `jev.join({id})` aliases `jev.wait({id})`. Both agent spellings use the same progress and detached-completion notification behavior.
 Advanced workflow skills are user-invoked; never load them autonomously. When the user has explicitly invoked an agent or mesh workflow, `<skill-dir>/references/agents.md` and `<skill-dir>/references/mesh.md` are branch pointers for low-level API detail.
 
 `agents.self()` and `agents.members({scope?,kinds?})` expose one leased directory of intrinsic roots, agents, and actors. `agents.main()` and `agents.peers()` are compatibility views of root participants. **Peer is a reserved Fabric term for another root Pi session, not a child agent.** When the user says “peer,” query `agents.peers()` first; do not infer peer state from `agents.list()` or from `agents.members({ kinds: ["agent"] })`. `agents.list()` defaults to local child agents; use `scope: "lineage" | "project"` for federated agent discovery. Cross-process `steer`, `followUp`, and `stop` resolve `ownerHostId` and return only after the owner acknowledges. `agents.subscribe()` creates a durable source-qualified Pi/run lifecycle route; use it instead of model-authored status polling when another participant boundary should notify Main or an agent. Detached `agents.spawn()` already sends Main a terminal follow-up by default unless the caller later waits. Set `residency: "durable"` on `agents.spawn()` or `agents.create()` only when the participant must outlive the current Pi host; Fabric lazily transfers it to the hidden resident host in a trusted mesh-enabled project.
@@ -123,4 +143,6 @@ Persistent actors may declare `requires: ["provider.action", { ref: "provider.op
 
 Agent requests and persistent actors accept `runner: "pi" | "claude"`. Pi is the default and is required for `recursive: true`, `rlm.query()`, and actors that must call Fabric or mesh APIs themselves. Claude invokes the official `claude -p` harness; it supports mapped Claude Code tools and host-managed persistent actors, but not recursive/direct Fabric APIs. Use `agents.models({ runner: "claude" })` for runtime-enumerated `claude/<value>` model keys.
 
-Omit `timeoutMs` for agents and actors unless requesting longer than the configured `agents.timeoutMs` (60 minutes by default). Per-call values below the configured default are ignored.
+For Pi model selection, copy `key` from `agents.models({ runner: "pi" })`, reuse a successful handle's `model`, or use a configured alias. Never infer a model's version from an agent name or another model's version. Exact provider/model matches win; near-miss IDs resolve to the closest available model on that same provider. Check the returned handle's canonical `model`. Unknown providers and unrelated names still fail. For independent launches, await `Promise.allSettled` and inspect every result: an uncaught `Promise.all` rejection ends the program and can abort still-pending siblings. Preserve successful handles when retrying failures.
+
+Omit `timeoutMs` for agents and actors unless requesting longer than the configured `agents.timeoutMs` (24 hours by default, the policy ceiling). Per-call values below the configured default are ignored.

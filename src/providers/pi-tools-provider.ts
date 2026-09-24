@@ -1,10 +1,12 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import {
   createBashToolDefinition,
   createEditToolDefinition,
   createFindToolDefinition,
   createGrepToolDefinition,
+  createLocalBashOperations,
   createLsToolDefinition,
   createReadToolDefinition,
   type AgentToolResult,
@@ -15,15 +17,25 @@ import {
 import { tryExecuteGitWorktreeAdd } from "../agents/bash-worktree-add.js";
 import { runAbortable, throwIfAborted } from "../async-settlement.js";
 import { CapturedToolCatalog } from "../capture/catalog.js";
+import { readFabricBashMiddleware } from "../core/shell-middleware.js";
 import {
   isPiShellToolName,
   PI_CORE_TOOL_NAMES,
   type PiCoreToolName,
 } from "../core/pi-tools.js";
 import { classifyPiBashError, piBashResultError } from "../core/pi-bash-error.js";
+import {
+  appendShellHangNotice,
+  DEFAULT_SHELL_HANG_MS,
+  FabricShellJobStore,
+  formatShellHangNotice,
+  raceShellHang,
+  trackShellOperations,
+} from "../core/shell-jobs.js";
 import { expandSkillDirMarkersForRead } from "../core/skill-dir.js";
 import type {
   FabricActionDescriptor,
+  FabricBashMiddlewareV1,
   FabricInvocationContext,
   FabricMediaBlock,
   FabricProvider,
@@ -51,6 +63,13 @@ import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 const closedPiInputSchema = (name: PiCoreToolName, source: unknown): Record<string, unknown> => {
   const schema = source as Record<string, unknown>;
   const properties = { ...(schema.properties as Record<string, unknown>) };
+  if (name === "bash" || name === "powershell") {
+    properties.background = {
+      type: "boolean",
+      description:
+        "Detach immediately: the await returns ok:true with a still-running notice, pid, and live output path. Do not poll; pi.read the path when you need output.",
+    };
+  }
   if (name === "edit") {
     properties.all = { type: "boolean", description: "Apply every replacement to all matching occurrences." };
     const edits = properties.edits as Record<string, unknown> | undefined;
@@ -70,6 +89,8 @@ const MAX_REPLACE_ALL_FILE_CHARS = 2_000_000;
 interface PiToolsProviderHostCapabilities {
   requireCapturedOverrides?: boolean;
   powerShellToolDefinitionFactory: ShellDefinitionFactory | undefined;
+  getShellHangMs?: () => number;
+  shellJobs?: FabricShellJobStore;
 }
 
 const DEFAULT_HOST_CAPABILITIES: PiToolsProviderHostCapabilities = {
@@ -221,6 +242,9 @@ export class PiToolsProvider implements FabricProvider {
   readonly #requireCapturedOverrides: boolean;
   readonly #bashDefinitions = new BashCwdDefinitions();
   readonly #powershellDefinitions: PowerShellCwdDefinitions | undefined;
+  readonly #shellJobs: FabricShellJobStore;
+  readonly #ownsShellJobs: boolean;
+  readonly #getShellHangMs: (() => number) | undefined;
 
   constructor(
     cwd: string,
@@ -246,6 +270,17 @@ export class PiToolsProvider implements FabricProvider {
     };
     this.#catalog = catalog;
     this.#capturedTools = capturedTools;
+    this.#ownsShellJobs = hostCapabilities.shellJobs === undefined;
+    this.#shellJobs = hostCapabilities.shellJobs ?? new FabricShellJobStore();
+    this.#getShellHangMs = hostCapabilities.getShellHangMs;
+  }
+
+  get shellJobs(): FabricShellJobStore {
+    return this.#shellJobs;
+  }
+
+  async close(): Promise<void> {
+    if (this.#ownsShellJobs) await this.#shellJobs.close();
   }
 
   async list(
@@ -270,7 +305,17 @@ export class PiToolsProvider implements FabricProvider {
     const name = actionName as PiCoreToolName;
     if (this.#allowedTools && !this.#allowedTools.has(name)) return undefined;
     const override = await this.#capturedTools?.describe(name, _context);
-    if (override) return { ...override, namespace: "extension-override" };
+    if (override) {
+      if (this.#bashMiddleware(name)) {
+        return {
+          ...override,
+          description: `${override.description} Shell execution and background jobs are managed by Fabric with the extension's middleware.`,
+          inputSchema: this.#descriptor(name, this.#tools[name]!).inputSchema,
+          namespace: "extension-middleware",
+        };
+      }
+      return { ...override, namespace: "extension-override" };
+    }
     const tool = this.#tools[name];
     if (!tool || this.#requireCapturedOverrides) return undefined;
     return this.#descriptor(name, tool);
@@ -278,12 +323,13 @@ export class PiToolsProvider implements FabricProvider {
 
   prepareArguments(actionName: string, args: Record<string, unknown>): Record<string, unknown> {
     this.#assertAllowed(actionName);
-    const definition = this.#catalog?.get(actionName)?.definition ?? this.#tools[actionName as PiCoreToolName];
+    const middleware = this.#bashMiddleware(actionName);
+    const definition = (middleware ? undefined : this.#catalog?.get(actionName)?.definition) ?? this.#tools[actionName as PiCoreToolName];
     const properties = (definition?.parameters as { properties?: Record<string, unknown> } | undefined)?.properties ?? {};
     // An override's declared properties are canonical, even when their spelling
     // is a built-in alias. Both kernels use this same preparation before validation.
     args = normalizePiArguments(actionName, args, Object.keys(properties)) as Record<string, unknown>;
-    if (this.#catalog?.get(actionName)) {
+    if (this.#catalog?.get(actionName) && !middleware) {
       return this.#capturedTools!.prepareArguments(actionName, args);
     }
     const tool = this.#tools[actionName as PiCoreToolName];
@@ -384,6 +430,137 @@ export class PiToolsProvider implements FabricProvider {
       : context;
   }
 
+  #bashMiddleware(name: string) {
+    if (name !== "bash" || this.#requireCapturedOverrides) return undefined;
+    return readFabricBashMiddleware(this.#catalog?.get(name)?.definition);
+  }
+
+  #shellHangMs(): number {
+    const value = this.#getShellHangMs?.() ?? DEFAULT_SHELL_HANG_MS;
+    return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : DEFAULT_SHELL_HANG_MS;
+  }
+
+  #trackedShellDefinition(
+    name: "bash" | "powershell",
+    args: Record<string, unknown>,
+    job: ReturnType<FabricShellJobStore["begin"]>,
+    middleware: FabricBashMiddlewareV1 | undefined,
+  ): ToolDefinition<any, any, any> {
+    const cwd = typeof args[PI_BASH_CWD_KEY] === "string" ? args[PI_BASH_CWD_KEY] : this.#cwd;
+    if (name === "bash") {
+      const options = middleware?.options;
+      const local = createLocalBashOperations(options?.shellPath !== undefined ? { shellPath: options.shellPath } : undefined);
+      const operations = middleware ? middleware.wrapOperations(local) : local;
+      if (!operations || typeof operations.exec !== "function") {
+        throw new Error("Invalid Fabric bash middleware operations; refusing to bypass shell protection");
+      }
+      return createBashToolDefinition(cwd, {
+        ...options,
+        operations: trackShellOperations(operations, job, "bash"),
+      });
+    }
+    const create = Reflect.get(PiCodingAgent, "createPowerShellToolDefinition");
+    const operationsFactory = Reflect.get(PiCodingAgent, "createLocalPowerShellOperations");
+    if (typeof create !== "function" || typeof operationsFactory !== "function") {
+      return this.#definitionFor(name, args);
+    }
+    return create(cwd, {
+      operations: trackShellOperations(operationsFactory(), job, "powershell"),
+    });
+  }
+
+  async #runExecute(
+    name: PiCoreToolName,
+    tool: ToolDefinition<any, any, any>,
+    args: Record<string, unknown>,
+    context: FabricInvocationContext,
+    onUpdate: (partialResult: PiToolResult) => void,
+    middleware: FabricBashMiddlewareV1 | undefined,
+  ): Promise<PiToolResult> {
+    if (!isPiShellToolName(name) || this.#requireCapturedOverrides) {
+      return await runAbortable(context.signal, () =>
+        tool.execute(
+          context.nestedToolCallId,
+          args,
+          context.signal,
+          onUpdate,
+          this.#executionContextFor(name, args, context.extensionContext),
+        ),
+      ) as PiToolResult;
+    }
+    return this.#executeHungShell(name, args, context, onUpdate, middleware);
+  }
+
+  async #executeHungShell(
+    name: "bash" | "powershell",
+    args: Record<string, unknown>,
+    context: FabricInvocationContext,
+    onUpdate: (partialResult: PiToolResult) => void,
+    middleware: FabricBashMiddlewareV1 | undefined,
+  ): Promise<PiToolResult> {
+    const command = typeof args.command === "string" ? args.command : "";
+    const background = args.background === true;
+    const executeArgs = background || "background" in args
+      ? (({ background: _ignored, ...rest }) => rest)(args)
+      : args;
+    const job = this.#shellJobs.begin(name, command);
+    let tool: ToolDefinition<any, any, any>;
+    try {
+      tool = this.#trackedShellDefinition(name, executeArgs, job, middleware);
+    } catch (error) {
+      await job.finish(null);
+      throw error;
+    }
+    void job.readPid();
+    let spilled = false;
+    const outcome = await raceShellHang({
+      hangMs: background ? 0 : this.#shellHangMs(),
+      immediate: background,
+      parentSignal: context.signal,
+      job,
+      execute: (signal) =>
+        tool.execute(
+          context.nestedToolCallId,
+          executeArgs,
+          signal,
+          (partialResult) => {
+            if (spilled) return;
+            onUpdate(partialResult as PiToolResult);
+          },
+          this.#executionContextFor(name, args, context.extensionContext),
+        ),
+    });
+    if (outcome.status === "done") {
+      await job.finish(0);
+      return outcome.value as PiToolResult;
+    }
+    if (outcome.status === "error") {
+      await job.finish(null);
+      throw outcome.error;
+    }
+    spilled = true;
+    const logPath = await job.persistLog();
+    const pid = await job.readPid();
+    const elapsedMs = Date.now() - job.startedAt;
+    const notice = formatShellHangNotice({
+      elapsedMs,
+      logPath,
+      ...(pid !== undefined ? { pid } : {}),
+    });
+    const output = appendShellHangNotice(job.snapshotText(), notice);
+    context.update(`${name}: still running after ${Math.max(1, Math.round(elapsedMs / 1000))}s`);
+    return {
+      content: [{ type: "text", text: output }],
+      details: {
+        running: true,
+        elapsedMs,
+        logPath,
+        fullOutputPath: logPath,
+        ...(pid !== undefined ? { pid } : {}),
+      },
+    };
+  }
+
   async invoke(
     actionName: string,
     args: Record<string, unknown>,
@@ -392,17 +569,19 @@ export class PiToolsProvider implements FabricProvider {
     const name = actionName as PiCoreToolName;
     this.#assertAllowed(name);
     if (!this.#requireCapturedOverrides && !this.#tools[name]) throw new Error(`Unknown Pi tool: ${actionName}`);
-    if (name === "bash" && !this.#requireCapturedOverrides) {
+    if (name === "bash" && !this.#requireCapturedOverrides && !this.#catalog?.get(name)) {
       const intercepted = await tryExecuteGitWorktreeAdd(args, this.#cwd);
       if (intercepted) {
         this.#attachPreview(name, intercepted, args, context);
         return this.#normalizeResult(name, intercepted, args);
       }
     }
+    // Pin the selected protection across awaited lifecycle hooks/catalog refreshes.
+    const middleware = this.#bashMiddleware(name);
     // A captured extension override (e.g. an extension that registered a "read"
     // tool) already replays the full event lifecycle itself via
     // CapturedToolsProvider, so delegate to it unchanged.
-    if (this.#catalog?.get(name)) {
+    if (this.#catalog?.get(name) && !middleware) {
       const result = await this.#capturedTools!.invoke(name, args, context);
       this.#attachReadMedia(name, result, context);
       this.#attachReadNote(name, result, context);
@@ -415,14 +594,13 @@ export class PiToolsProvider implements FabricProvider {
     // catalog) fall back to a direct execute — no extension hooks fire, but
     // the call still works. Once tools are refreshed the runner is available.
     if (!runner) {
-      const result = await runAbortable(context.signal, () =>
-        tool.execute(
-          context.nestedToolCallId,
-          args,
-          context.signal,
-          (partialResult) => this.#attachPartialPreview(name, partialResult, args, context),
-          this.#executionContextFor(name, args, context.extensionContext),
-        ),
+      const result = await this.#runExecute(
+        name,
+        tool,
+        args,
+        context,
+        (partialResult) => this.#attachPartialPreview(name, partialResult, args, context),
+        middleware,
       ).catch((error) => {
         throwIfAborted(context.signal);
         throw isPiShellToolName(name) ? classifyPiBashError(error) : error;
@@ -432,7 +610,7 @@ export class PiToolsProvider implements FabricProvider {
       this.#attachPreview(name, result, args, context);
       return this.#normalizeResult(name, result, args);
     }
-    return this.#invokeWithEvents(name, tool, args, context, runner);
+    return this.#invokeWithEvents(name, tool, args, context, runner, middleware);
   }
 
   // Replay the agent-core tool-execution lifecycle for a nested pi.* call, so
@@ -449,6 +627,7 @@ export class PiToolsProvider implements FabricProvider {
     args: Record<string, unknown>,
     context: FabricInvocationContext,
     runner: ExtensionRunner,
+    middleware: FabricBashMiddlewareV1 | undefined,
   ): Promise<unknown> {
     const toolCallId = context.nestedToolCallId;
     await runAbortable(context.signal, () => runner.emit({
@@ -474,10 +653,11 @@ export class PiToolsProvider implements FabricProvider {
         throw new Error(preflight.reason || `Pi tool ${name} was blocked`);
       }
       executionStarted = true;
-      result = (await runAbortable(context.signal, () => tool.execute(
-        toolCallId,
+      result = await this.#runExecute(
+        name,
+        tool,
         args,
-        context.signal,
+        context,
         (partialResult) => {
           this.#attachPartialPreview(name, partialResult, args, context);
           updateTail = updateTail
@@ -492,8 +672,8 @@ export class PiToolsProvider implements FabricProvider {
             )
             .catch(() => undefined);
         },
-        this.#executionContextFor(name, args, context.extensionContext),
-      ))) as PiToolResult;
+        middleware,
+      );
     } catch (error) {
       thrown = isPiShellToolName(name) && executionStarted ? classifyPiBashError(error) : error;
       isError = true;

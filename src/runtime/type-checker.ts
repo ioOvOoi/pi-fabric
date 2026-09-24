@@ -127,7 +127,7 @@ class FabricTypeChecker {
     };
   }
 
-  check(code: string, prelude?: string): FabricTypeCheckResult {
+  check(code: string, prelude?: string, includeTypeCorrectness = false): FabricTypeCheckResult {
     // 宿主 prelude 必须参与这次编译：模型代码要能看到它声明的符号（扩展注入的 staffs.* 之类），
     // 否则门禁会把模型的每一次调用都判成 Cannot find name —— 那正是 prelude 通道要治的病。
     // 代价是诊断行号整体后移，所以下面统一减掉 prelude 占的行数，并把落在 prelude 行域内的诊断丢掉
@@ -154,7 +154,7 @@ class FabricTypeChecker {
       ...program.getSyntacticDiagnostics(this.#sourceFile),
       ...program
         .getSemanticDiagnostics(this.#sourceFile)
-        .filter((diagnostic) => !TYPE_CORRECTNESS_CODES.has(diagnostic.code)),
+        .filter((diagnostic) => includeTypeCorrectness || !TYPE_CORRECTNESS_CODES.has(diagnostic.code)),
     ];
     const errors = diagnostics.map((diagnostic) => {
       const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n");
@@ -253,7 +253,8 @@ export const typeCheckFabricCode = (
   code: string,
   declarations: string,
   prelude?: string,
-): FabricTypeCheckResult => checkerFor(declarations).check(code, prelude);
+  includeTypeCorrectness = false,
+): FabricTypeCheckResult => checkerFor(declarations).check(code, prelude, includeTypeCorrectness);
 
 /**
  * prelude 的独立门禁缓存。
@@ -311,4 +312,5 @@ export const transpileGuestPreludeBody = (prelude: string): string =>
 export const resetGuestPreludeCache = (): void => {
   guestPreludeCache.clear();
 };
+
 
