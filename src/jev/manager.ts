@@ -114,7 +114,8 @@ export class JevProgramManager {
       const { TypeScriptKernelRuntime } = await import("../runtime/typescript-kernel.js");
       const runtime = new TypeScriptKernelRuntime("quickjs");
       const sources = await registry.guestTypeSources({ ...context, capabilityView: lease.view });
-      const { code, checked } = runtime.prepare(prelude + definition.code, true, [], sources, [], true);
+      // prepare 第 6 参数是宿主 prelude（本地分支特性），includeTypeCorrectness 顺延到第 7 位，故显式跳过前者。
+      const { code, checked } = runtime.prepare(prelude + definition.code, true, [], sources, [], undefined, true);
       if (checked.errors.length) throw new Error(`Jev program typecheck failed: ${checked.errors.map(e => e.message).join("; ").slice(0, 2000)}`);
       const approval = new ApprovalController(config.approvals, context.extensionContext, this.#approvals, new FabricAutoApprovalClassifier(() => config.jev));
       if (observe) await approval.approve({

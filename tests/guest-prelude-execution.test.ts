@@ -13,7 +13,8 @@ const options = {
 // （符号可见、模型代码的行号不因 prelude 漂移）。单元测试只保证拼接数学，这里保证能跑。
 const execute = async (source: string, prelude?: string) => {
   // 宿主 prelude 要一起进编译：模型代码得看得见它声明的符号（这正是通道存在的理由）。
-  const checked = typeCheckFabricCode(source, GUEST_TYPE_DECLARATIONS, prelude);
+  // 形参顺序与上游一致：第三位是 includeTypeCorrectness，prelude 在末尾。
+  const checked = typeCheckFabricCode(source, GUEST_TYPE_DECLARATIONS, false, prelude);
   expect(checked.errors).toEqual([]);
   const bundle = composeGuestBundle({
     ...(prelude === undefined ? {} : { prelude: transpileGuestPreludeBody(prelude) }),

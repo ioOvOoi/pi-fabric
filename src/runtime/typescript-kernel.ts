@@ -42,7 +42,7 @@ export class TypeScriptKernelRuntime implements FabricKernelRuntime {
       dynamic: buildDynamicGuestDeclarations(sources),
       ...(coreOverrides ? { coreOverrides } : {}),
     });
-    const checked = typeCheckFabricCode(code, declarations, prelude, includeTypeCorrectness);
+    const checked = typeCheckFabricCode(code, declarations, includeTypeCorrectness, prelude);
     const preludeCheck = prelude ? typeCheckGuestPrelude(prelude, declarations) : undefined;
     return { code, checked, ...(preludeCheck ? { preludeCheck } : {}) };
   }

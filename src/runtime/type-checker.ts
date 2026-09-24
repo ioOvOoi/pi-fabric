@@ -252,8 +252,8 @@ export const transpileFabricCodeWithSourceMap = (code: string): FabricTranspileR
 export const typeCheckFabricCode = (
   code: string,
   declarations: string,
-  prelude?: string,
   includeTypeCorrectness = false,
+  prelude?: string,
 ): FabricTypeCheckResult => checkerFor(declarations).check(code, prelude, includeTypeCorrectness);
 
 /**
